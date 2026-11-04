@@ -292,14 +292,21 @@ class SyncService : Service() {
         val raw = Socket().apply { tcpNoDelay = true }
         currentSocket = raw
         raw.connect(InetSocketAddress(host, port), 5_000)
+        peerFingerprint = null
         val sock = raw.startHandshakeSsl(sslContext)
         sock.soTimeout = Proto.SILENCE
+        // 握手已同步完成（startHandshakeSsl 内 startHandshake）；指纹从会话
+        // 证书链确定性读取，不依赖 TrustManager 回调时序。
+        peerFingerprint = runCatching {
+            Store.fingerprintOf(sock.session.peerCertificates[0])
+        }.getOrNull()
         Log.i(TAG, "TLS 已建立 peer=$host fp=${peerFingerprint?.let { Store.short(it) }}")
 
         val out = DataOutputStream(BufferedOutputStream(sock.getOutputStream()))
         val input = DataInputStream(BufferedInputStream(sock.getInputStream()))
 
         // ---- 配对交换：Q → 等 A（成功后补发 HELLO 进入正常会话，协议 §4） ----
+        var helloDuringPairing: String? = null
         if (pairReq) {
             sock.soTimeout = 65_000
             val code = synchronized(PairCtl.lock) { PairCtl.code }
@@ -308,23 +315,38 @@ class SyncService : Service() {
                     Proto.pairRequestPayload(code, android.os.Build.MODEL))
                 out.flush()
             }
-            val (type, payload) = Proto.readFrame(input)
-            when (type) {
-                Proto.F_PAIR_ACCEPT -> {
-                    val pcName = Proto.parseName(payload)
-                    val fp = peerFingerprint!!
-                    Store.add(this, pcName, fp, host)
-                    event("配对成功：$pcName (${Store.short(fp)})")
-                    finishPair(true, "已配对 $pcName")
-                    pcHost = host
-                    pcPort = port
-                    updateSeen(fp, host)
+            // PC 在 TLS 完成后立即发 HELLO（会话建立），配对 A 在其后；收到 H 就
+            // 当场消化（校验版本 + 记下会话状态），避免配对完成后再空等 10 s。
+            var accepted = false
+            while (!accepted) {
+                val (type, payload) = Proto.readFrame(input)
+                when (type) {
+                    Proto.F_PAIR_ACCEPT -> {
+                        val pcName = Proto.parseName(payload)
+                        val fp = peerFingerprint!!
+                        Store.add(this, pcName, fp, host)
+                        event("配对成功：$pcName (${Store.short(fp)})")
+                        finishPair(true, "已配对 $pcName")
+                        pcHost = host
+                        pcPort = port
+                        updateSeen(fp, host)
+                        accepted = true
+                    }
+                    Proto.F_HELLO -> {
+                        val (ver, name, _) = Proto.parseHello(payload)
+                        if (ver != Proto.VER) {
+                            finishPair(false, "PC 版本不符")
+                            throw PairDone()
+                        }
+                        helloDuringPairing = name
+                        Log.i(TAG, "配对中收到 HELLO：$name")
+                    }
+                    Proto.F_BYE -> {
+                        finishPair(false, "被拒：${String(payload.copyOfRange(1, payload.size))}")
+                        throw PairDone()
+                    }
+                    else -> { finishPair(false, "配对应答异常 0x${type.toString(16)}"); throw PairDone() }
                 }
-                Proto.F_BYE -> {
-                    finishPair(false, "被拒：${String(payload.copyOfRange(1, payload.size))}")
-                    throw PairDone()
-                }
-                else -> { finishPair(false, "配对应答异常 0x${type.toString(16)}"); throw PairDone() }
             }
         } else {
             val fp = peerFingerprint!!
@@ -337,8 +359,13 @@ class SyncService : Service() {
         }
 
         // ---- HELLO 互发（ver 不符收 BYE，协议 §5） ----
+        // 重置会话状态，再应用配对阶段已消化的对端 HELLO（若有）。
         sessionReady = false
         peerName = null
+        helloDuringPairing?.let {
+            peerName = it
+            sessionReady = true
+        }
         synchronized(sendLock) {
             Proto.writeFrame(out, Proto.F_HELLO, Proto.helloPayload(android.os.Build.MODEL, CAPS))
             out.flush()
@@ -361,7 +388,8 @@ class SyncService : Service() {
     }
 
     private fun Socket.startHandshakeSsl(sc: SSLContext): SSLSocket =
-        sc.socketFactory.createSocket(this, this.inetAddress.hostAddress, this.port, true) as SSLSocket
+        (sc.socketFactory.createSocket(this, this.inetAddress.hostAddress, this.port, true) as SSLSocket)
+            .also { it.startHandshake() }
 
     private class EOF : IOException("connection closed")
 
@@ -594,6 +622,9 @@ class SyncService : Service() {
                     Proto.F_BYE -> {
                         Log.i(TAG, "对端 BYE：${payload.drop(1).toByteArray().toString(Charsets.UTF_8)}")
                         return
+                    }
+                    Proto.F_FILE_PROGRESS -> {
+                        // 对端接收进度（每 4MiB 一发，兼存活探针）；无 UI 消费，静默
                     }
                     else -> {
                         Log.w(TAG, "未知帧 0x${type.toString(16)}，忽略")
