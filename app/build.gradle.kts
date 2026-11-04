@@ -14,8 +14,8 @@ android {
         // targetSdk 34 (Android 14): 强制 FGS 类型 + 通知运行时权限，
         // 避开 Android 15 的 dataSync 前台服务 6 小时超时
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.0.1"
     }
 
     buildTypes {

@@ -70,12 +70,13 @@
             </intent-filter>
         </activity>
 
-        <!-- 开机自启 SyncService -->
+        <!-- 开机自启 + 覆盖安装后自启 SyncService -->
         <receiver
             android:name=".BootReceiver"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 
