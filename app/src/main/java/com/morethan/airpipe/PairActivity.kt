@@ -1,8 +1,16 @@
 package com.morethan.airpipe
 
+import android.Manifest
 import android.app.Activity
+import android.app.NotificationManager
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
+import android.os.PowerManager
+import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -26,7 +34,14 @@ class PairActivity : Activity() {
     private lateinit var ipInput: EditText
     private lateinit var pairButton: Button
     private lateinit var pairedBox: LinearLayout
+    private lateinit var permStatus: TextView
+    private lateinit var notifStatus: TextView
+    private lateinit var batteryStatus: TextView
     @Volatile private var polling = false
+
+    companion object {
+        private const val REQ_NOTIF = 1001
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -70,7 +85,61 @@ class PairActivity : Activity() {
     private fun refresh() {
         statusView.text = "状态：${SyncService.status()}"
         eventView.text = "最近事件：${SyncService.event()}"
+        permStatus.text = "存储权限：${if (Environment.isExternalStorageManager()) "✅ 已开启" else "❌ 未开启（接收文件落盘需要）"}"
+        notifStatus.text = "通知权限：${
+            if (getSystemService(NotificationManager::class.java).areNotificationsEnabled()) "✅ 已开启"
+            else "❌ 未开启（常驻通知需要）"
+        }"
+        batteryStatus.text = "省电策略：${
+            if (getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)) "✅ 无限制"
+            else "❌ 未设无限制（后台可能被冻结）"
+        }"
         renderPaired()
+    }
+
+    /** 通知权限：先请求运行时弹框；已永久拒绝则跳系统通知设置页。 */
+    private fun requestNotif() {
+        if (getSystemService(NotificationManager::class.java).areNotificationsEnabled()) {
+            refresh(); return
+        }
+        runCatching {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIF)
+        }.onFailure {
+            jumpNotifSettings()
+        }
+    }
+
+    private fun jumpNotifSettings() {
+        runCatching {
+            startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
+        }
+    }
+
+    /** 省电无限制：系统授权弹框；部分 ROM 无该页则退到总列表。 */
+    private fun requestBattery() {
+        if (getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)) {
+            refresh(); return
+        }
+        runCatching {
+            startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.parse("package:$packageName")))
+        }.onFailure {
+            runCatching { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQ_NOTIF) return
+        if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            Toast.makeText(this, "通知权限已开启", Toast.LENGTH_SHORT).show()
+        } else {
+            // 拒绝后可能不再弹框 → 直接跳系统通知设置页
+            jumpNotifSettings()
+        }
+        refresh()
     }
 
     // ---------------------------------------------------------------- UI
@@ -128,10 +197,42 @@ class PairActivity : Activity() {
 
         // 权限引导
         root.addView(gap()); root.addView(title("装机一次性设置"))
-        root.addView(body(
-            "① adb shell appops set com.morethan.airpipe MANAGE_EXTERNAL_STORAGE allow\n" +
-                "② 系统设置 → 通知 → Airpipe → 开启通知权限\n" +
-                "③ 省电策略设为「无限制」+ 允许自启动（HyperOS 后台冻结会掐 socket）"))
+        permStatus = body("").also { root.addView(it) }
+        root.addView(Button(this).apply {
+            text = "① 开启存储权限（所有文件访问）"
+            setOnClickListener {
+                val pkg = Uri.parse("package:$packageName")
+                runCatching {
+                    startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, pkg))
+                }.onFailure {
+                    runCatching { startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) }
+                }
+            }
+        })
+        notifStatus = body("").also { root.addView(it) }
+        root.addView(Button(this).apply {
+            text = "② 开启通知权限"
+            setOnClickListener { requestNotif() }
+        })
+        batteryStatus = body("").also { root.addView(it) }
+        root.addView(Button(this).apply {
+            text = "③ 省电策略设为「无限制」"
+            setOnClickListener { requestBattery() }
+        })
+        root.addView(Button(this).apply {
+            text = "④ 允许自启动（HyperOS）"
+            setOnClickListener {
+                runCatching {
+                    startActivity(Intent("miui.intent.action.OP_AUTO_START")
+                        .putExtra("extra_pkg", packageName))
+                }.onFailure {
+                    runCatching {
+                        startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.parse("package:$packageName")))
+                    }
+                }
+            }
+        })
 
         return scroll
     }

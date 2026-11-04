@@ -136,6 +136,27 @@ class SyncService : Service() {
             notifCtx?.let { refreshNotification(it) }
         }
 
+        class Prog(val label: String, val total: Long, val done: Long)
+        @Volatile private var transfer: Prog? = null
+        @Volatile private var lastProgNotif = 0L
+
+        /** 传输进度上报（发送/接收共用），300ms 节流刷新常驻通知进度条。 */
+        fun reportProgress(label: String, total: Long, done: Long) {
+            transfer = Prog(label, total, done)
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastProgNotif > 300) {
+                lastProgNotif = now
+                notifCtx?.let { refreshNotification(it) }
+            }
+        }
+
+        fun clearTransfer() {
+            if (transfer != null) {
+                transfer = null
+                notifCtx?.let { refreshNotification(it) }
+            }
+        }
+
         fun updateStatus(ctx: Context, s: String) {
             if (statusText == s && notifCtx != null) return
             statusText = s
@@ -150,10 +171,11 @@ class SyncService : Service() {
         }
 
         private fun buildNotif(ctx: Context): Notification {
+            // 点通知 = 同步（蹦床读剪贴板入队 + nudge），不开 App
             val sync = PendingIntent.getActivity(
                 ctx, 0,
                 Intent(ctx, TrampolineActivity::class.java)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK),
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
             val copy = PendingIntent.getActivity(
@@ -163,8 +185,10 @@ class SyncService : Service() {
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
-            val pair = PendingIntent.getActivity(
-                ctx, 3, Intent(ctx, PairActivity::class.java),
+            val openApp = PendingIntent.getActivity(
+                ctx, 3,
+                Intent(ctx, PairActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
             val delete = PendingIntent.getBroadcast(
@@ -173,15 +197,30 @@ class SyncService : Service() {
             )
             val b = Notification.Builder(ctx, CHANNEL_ID)
                 .setContentTitle("Airpipe — $statusText")
-                .setContentText(lastEvent)
                 .setSmallIcon(android.R.drawable.stat_sys_download_done)
-                .setContentIntent(pair)
+                .setContentIntent(sync)
                 .setOngoing(true)
                 .setDeleteIntent(delete)
                 .setOnlyAlertOnce(true)
-                .addAction(android.R.drawable.ic_menu_send, "立即同步", sync)
+            val t = transfer
+            if (t != null) {
+                if (t.total > 0) {
+                    val pct = (t.done * 100 / t.total).toInt().coerceIn(0, 100)
+                    b.setContentText("${t.label}  $pct%")
+                    b.setProgress(100, pct, false)
+                } else {
+                    b.setContentText("${t.label}  传输中…")
+                    b.setProgress(0, 0, true)
+                }
+            } else {
+                b.setContentText(lastEvent)
+            }
+            if (Store.load(ctx).isEmpty()) {
+                b.addAction(android.R.drawable.ic_menu_add, "配对", openApp)
+            } else {
+                b.addAction(android.R.drawable.ic_menu_compass, "打开", openApp)
+            }
             if (degradedCopy != null) b.addAction(android.R.drawable.ic_menu_edit, "复制", copy)
-            if (Store.load(ctx).isEmpty()) b.addAction(android.R.drawable.ic_menu_add, "配对", pair)
             return b.build()
         }
     }
@@ -382,6 +421,7 @@ class SyncService : Service() {
         try {
             writerLoop(sock, out)
         } finally {
+            clearTransfer()
             runCatching { sock.close() }
             runCatching { reader.interrupt() }
         }
@@ -456,15 +496,30 @@ class SyncService : Service() {
                     event("已推送剪贴板文本 ${job.bytes.size}B")
                 }
                 is FileJob -> {
+                    // 不可读（URI 授权失效 / 文件被删）：终态放弃，别堵死队列
+                    if (!runCatching {
+                            contentResolver.openInputStream(job.uri)?.close()
+                            true
+                        }.getOrDefault(false)) {
+                        queue.poll()
+                        event("文件不可读，已跳过：${job.name}")
+                        clearTransfer()
+                        continue
+                    }
                     var ok = false
                     var rejected = false
-                    repeat(2) { // sha 不符整文件重发一次（协议 §6）
+                    var attempt = 0
+                    // sha 不符整文件重发一次（协议 §6）。注意：repeat + return@repeat
+                    // 只退出当次 lambda，循环照走——曾导致每个文件都发两遍（真机复现）。
+                    while (attempt < 2 && !ok && !rejected) {
+                        attempt++
                         when (sendOneFile(out, job, nextId++)) {
-                            SendOutcome.OK -> { ok = true; return@repeat }
+                            SendOutcome.OK -> ok = true
                             SendOutcome.HASH_MISMATCH -> {}
-                            SendOutcome.PEER_REJECTED -> { rejected = true; return@repeat }
+                            SendOutcome.PEER_REJECTED -> rejected = true
                         }
                     }
+                    clearTransfer()
                     when {
                         ok -> queue.poll()
                         rejected -> queue.poll() // 对端 IO/取消：重发无益，终态放弃
@@ -492,6 +547,7 @@ class SyncService : Service() {
         }
         val digest = MessageDigest.getInstance("SHA-256")
         val buf = ByteArray(Proto.CHUNK)
+        var sent = 0L
         contentResolver.openInputStream(job.uri)?.use { ins ->
             while (true) {
                 val n = ins.read(buf)
@@ -505,6 +561,8 @@ class SyncService : Service() {
                     p[2] = (id ushr 8).toByte(); p[3] = id.toByte()
                     data.copyInto(p, 4)
                     synchronized(sendLock) { Proto.writeFrame(out, Proto.F_FILE_DATA, p) }
+                    sent += n
+                    reportProgress(job.name, if (job.sizeKnown) job.size else -1L, sent)
                 }
             }
         } ?: throw IOException("openInputStream failed: ${job.uri}")
@@ -546,6 +604,7 @@ class SyncService : Service() {
         val file: File,
         val stream: FileOutputStream,
         val digest: java.security.MessageDigest,
+        var total: Long = 0,
         var bytes: Long = 0,
         var sinceProgress: Long = 0,
         var failed: Boolean = false,
@@ -586,6 +645,7 @@ class SyncService : Service() {
                             t.digest.update(payload, 4, payload.size - 4)
                             t.bytes += payload.size - 4
                             t.sinceProgress += payload.size - 4
+                            reportProgress(t.file.name, t.total, t.bytes)
                             if (t.sinceProgress >= Proto.PROGRESS_EVERY) {
                                 t.sinceProgress = 0
                                 synchronized(sendLock) {
@@ -637,6 +697,7 @@ class SyncService : Service() {
         } catch (e: IOException) {
             Log.d(TAG, "入站连接结束: ${e.message}")
         } finally {
+            clearTransfer()
             transfers.values.forEach {
                 runCatching { it.stream.close() }
                 // 传输中断：.part 半截文件永不暴露正式名，直接清理
@@ -667,6 +728,7 @@ class SyncService : Service() {
                 b.id, target,
                 FileOutputStream(part),
                 MessageDigest.getInstance("SHA-256"),
+                total = if (b.flags and Proto.FLAG_SIZE_UNKNOWN != 0) -1L else b.size,
             )
         } catch (e: IOException) {
             Log.w(TAG, "B 帧建文件失败: ${e.message}")
@@ -676,6 +738,7 @@ class SyncService : Service() {
     private fun endInbound(payload: ByteArray, transfers: HashMap<Int, Inbound>, out: DataOutputStream) {
         val id = payload.readInt0()
         val t = transfers.remove(id) ?: return
+        clearTransfer()
         val part = File(t.file.parentFile, t.file.name + ".part")
         runCatching { t.stream.close() }
         if (t.failed) return

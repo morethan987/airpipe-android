@@ -15,7 +15,7 @@
 | 组件 | 职责 |
 | :--- | :--- |
 | `SyncService` | FGS 常驻。TLS 客户端连接循环、退避重拨、心跳看门狗、收发帧、出站队列、自动写剪贴板、常驻通知 |
-| `TrampolineActivity` | 透明蹦床：焦点瞬间读剪贴板（文本 / 文件 URI）→ 入队 → 自毁。通知栏「立即同步」触发 |
+| `TrampolineActivity` | 透明蹦床：焦点瞬间读剪贴板（文本 / 文件 URI）→ 入队 → 自毁。点击常驻通知触发（通知即同步，不开 App） |
 | `ShareReceiverActivity` | `ACTION_SEND` / `SEND_MULTIPLE` 分享接收：流式读 URI 入队，零 UI |
 | `PairActivity` | **唯一可见 UI**（同时是桌面图标入口）：连接状态、6 位码输入、手动 IP（高级）、已配对 PC 列表 / 取消配对、权限引导 |
 | `BootReceiver` | 开机自启 SyncService（RECEIVE_BOOT_COMPLETED；HyperOS 还需用户开「自启动」） |
@@ -28,9 +28,9 @@
 - 状态机：`未配对 → 发现中 → 连接中 → 在线 → (断线) → 退避等待 → 发现中 …`
 - 发现：UDP 广播（协议 §2），健康连接时不广播；失败清缓存地址重发现（容忍 DHCP）。
 - TLS：`javax.net.ssl.SSLContext`，KeyManager 挂本机身份证书（`files/identity.p12`），TrustManager 做指纹固定——对端证书指纹在已配对库中才放行；配对流程中才接受未知指纹。
-- 退避：2s 起指数翻倍封顶 60s；用户动作（分享 / 立即同步 / 配对提交 / 打开 App）nudge 立即全速重拨。
+- 退避：2s 起指数翻倍封顶 60s；用户动作（分享 / 点通知 / 配对提交 / 打开 App）nudge 立即全速重拨。
 - 看门狗：`soTimeout = 45s`，读超时即判死链断开重拨；同时应答 PC 每 15s 心跳。双向探活缺一不可（半开连接无 FIN/RST，探针实测）。
-- 出站队列：内存态 `ConcurrentLinkedQueue`，元素为**引用**（URI / 文本），任务只在整帧进 socket 且收到 `F(status=0)` 后出队；发送失败留队，重连自动补发。进程被杀即丢（与 PC 队列同哲学）。
+- 出站队列：内存态 `ConcurrentLinkedQueue`，元素为**引用**（URI / 文本），任务只在整帧进 socket 且收到 `F(status=0)` 后出队；发送失败留队，重连自动补发；**不可读 URI（授权失效/文件被删）终态跳过不堵队**；进程被杀即丢（与 PC 队列同哲学）。
 
 ## 剪贴板行为
 
@@ -38,7 +38,7 @@
 | :--- | :--- | :--- |
 | PC → 手机 | PC 复制（自动） | `T` 帧到达 → SyncService 直接 `setPrimaryClip`（写免焦点，**零点击**）。写入异常（个别 ROM 限制）→ 降级：通知动作「复制」走蹦床写入 |
 | PC → 手机 | PC 复制图片（自动） | `I` 帧 → 同上直接写入剪贴板（ClipData 带 MIME） |
-| 手机 → PC | 通知栏「立即同步」 | 蹦床获焦点读剪贴板：纯文本 → `T`；`content://` 文件 URI → 按文件流发送（HyperOS 文件管理器「copy to clipboard」实测可用） |
+| 手机 → PC | 点常驻通知（或分享面板） | 蹦床获焦点读剪贴板：纯文本 → `T`；`content://` 文件 URI → 按文件流发送（HyperOS 文件管理器「copy to clipboard」实测可用） |
 | 手机 → PC | 文本到达 | daemon 直接写 PC 剪贴板 |
 
 回声抑制由 PC 侧负责（协议 §9），手机侧不自动读剪贴板，无环。
@@ -64,10 +64,12 @@
 
 ```
 标题：Airpipe — 已连接 <PC名>   （连接中… / 未配对 / 退避等待中…）
-正文：最近事件（「收到 2 个文件」「已推送剪贴板」…，无事件则收件目录路径）
-动作：[立即同步]                    ← 蹦床读剪贴板发 PC
+正文：传输中为「文件名 + 百分比」并挂进度条（发送按已发字节、接收按已收字节，
+      300ms 节流；总量未知时转圈）；空闲时为最近事件
+点击通知 = 立即同步               ← contentIntent → 蹦床读剪贴板入队发 PC，不开 App
+动作：[打开]                      ← 已配对时：打开 PairActivity
+       [配对]                      ← 仅未配对时：打开 PairActivity
        [复制]                      ← 仅 PC 文本写入失败降级时出现
-       [配对]                      ← 仅未配对时出现，打开 PairActivity
 ```
 
 - `IMPORTANCE_LOW`（无声）；`foregroundServiceType = dataSync`。
@@ -79,10 +81,11 @@
 | :--- | :--- |
 | 大文件内存 | 全链路流式（分享 URI 流式读 / 接收 .part 流式写），峰值内存 ≈ 128 KiB 桶 |
 | 可靠性 | 帧层 sha256 终验（`F`），不符由 PC 整文件重发一次 |
+| 传输进度 | 常驻通知进度条：发送按已发字节 / 接收按已收字节，300ms 节流刷新 |
 | 半开死链 | 双向心跳 + 45s 读超时看门狗 |
 | 断线补发 | 出站引用队列 + 发送失败留队 + 重连清队 |
 | 冻结恢复 | START_STICKY + BootReceiver + deleteIntent 复活 + 用户 nudge 全速重拨 |
-| 交互延迟 | 分享/立即同步在服务未起时冷启动挂服务（探针已验证路径） |
+| 交互延迟 | 分享/点通知在服务未起时冷启动挂服务（探针已验证路径） |
 
 ## 权限与一次性授权仪式
 
@@ -95,7 +98,7 @@ MANAGE_EXTERNAL_STORAGE      <!-- 写 /storage/emulated/0/Airpipe -->
 RECEIVE_BOOT_COMPLETED
 ```
 
-装机后：①`adb shell appops set com.morethan.airpipe MANAGE_EXTERNAL_STORAGE allow`；②手动开通知权限；③省电策略「无限制」+ 自启动（PairActivity 内置分步引导页显示这三步）。
+装机后：①PairActivity 引导页点「开启存储权限」跳系统「所有文件访问」页，用户手开（普通用户无需 adb）；②手动开通知权限；③省电策略「无限制」+ 自启动（引导页分步列出）。
 
 ## 已知限制
 
