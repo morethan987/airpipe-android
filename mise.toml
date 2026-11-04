@@ -1,0 +1,11 @@
+[tools]
+java = "temurin-21"
+android-sdk = "latest"
+
+[env]
+ANDROID_HOME = "{{env.HOME}}/.local/share/mise/installs/android-sdk/latest"
+ANDROID_SDK_ROOT = "{{env.HOME}}/.local/share/mise/installs/android-sdk/latest"
+_.path = [
+  "{{env.HOME}}/.local/share/mise/installs/android-sdk/latest/cmdline-tools/23.0/bin",
+  "{{env.HOME}}/.local/share/mise/installs/android-sdk/latest/platform-tools"
+]

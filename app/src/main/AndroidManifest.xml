@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Android 13+ 通知运行时权限 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 常驻前台服务 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14 (targetSdk 34) 强制要求声明前台服务类型 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- TCP/UDP 连 PC -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- PC→手机 文件写入 /storage/emulated/0/Airpipe -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+    <!-- 开机自启 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <application
+        android:label="Airpipe"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:allowBackup="false"
+        android:theme="@android:style/Theme.Translucent.NoTitleBar">
+
+        <!-- 常驻前台服务：TLS 客户端连接循环 / 收发帧 / 出站队列 / 常驻通知 -->
+        <service
+            android:name=".SyncService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
+
+        <!-- 唯一可见 UI（桌面图标入口）：配对 / 状态 / 权限引导 -->
+        <activity
+            android:name=".PairActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 透明蹦床：焦点瞬间读剪贴板 → 入队 → 自毁（通知「立即同步」触发） -->
+        <activity
+            android:name=".TrampolineActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- 分享接收器：文件管理器/相册「分享 → Airpipe」，零 UI -->
+        <activity
+            android:name=".ShareReceiverActivity"
+            android:exported="true"
+            android:label="发送到 PC"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+
+        <!-- 开机自启 SyncService -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 常驻通知划掉兜底：deleteIntent → 重拉服务重挂通知 -->
+        <receiver
+            android:name=".DismissReceiver"
+            android:exported="false" />
+    </application>
+</manifest>

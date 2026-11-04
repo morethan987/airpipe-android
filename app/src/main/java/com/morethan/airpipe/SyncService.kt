@@ -1,0 +1,758 @@
+package com.morethan.airpipe
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.ClipData
+import android.content.ClipDescription
+import android.content.ContentValues
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.IBinder
+import android.provider.MediaStore
+import android.util.Log
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.net.SocketTimeoutException
+import java.security.MessageDigest
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSocket
+import kotlin.concurrent.thread
+
+
+/** 配对请求（PairActivity 发起，SyncService clientLoop 消费）。 */
+object PairCtl {
+    @Volatile var request = false
+    @Volatile var code = ""
+    @Volatile var host: String? = null // 手动 IP（高级），null=UDP 发现
+    @Volatile var result: Pair<Boolean, String>? = null
+    val lock = Object()
+}
+
+/**
+ * 常驻前台服务（手机侧全量实现）。
+ *  - HyperOS 静默丢弃入站连接 → 手机只做 TCP 客户端主动出站
+ *  - 退避 2s 起指数翻倍封顶 60s；用户动作 nudge 立即全速重拨
+ *  - TLS 1.3 双向证书认证，指纹固定（配对窗口内放行未知指纹）
+ *  - 看门狗 soTimeout=45s：无对端字节即判死链断开重拨
+ *  - 出站队列 ConcurrentLinkedQueue<Job>（引用，不缓存内容）；
+ *    文件整帧进 socket 且收 F(0) 且 sha256 相符才出队，失败留队补发
+ */
+class SyncService : Service() {
+
+    companion object {
+        private const val TAG = "Airpipe"
+        private const val CHANNEL_ID = "airpipe_channel"
+        private const val NOTIFICATION_ID = 1
+        private const val RECEIVE_DIR = "/storage/emulated/0/Airpipe"
+        private const val CAPS = 0b111 // 文本 | 图片 | 文件
+
+        // ---- 进程级共享状态（蹦床/分享/配对页在任意线程投递） ----
+        private val queue = ConcurrentLinkedQueue<Job>()
+        private val fileResults = HashMap<Int, CompletableFuture<FileResult>>()
+        private val resultLock = Any()
+
+        @Volatile private var nudge = false
+        @Volatile private var pcHost: String? = null
+        @Volatile private var pcPort = Proto.TCP_PORT
+        @Volatile private var statusText = "启动中…"
+        @Volatile private var lastEvent = "收件目录 $RECEIVE_DIR"
+        @Volatile private var degradedCopy: String? = null // 写剪贴板失败的待复制文本
+        @Volatile private var currentSocket: Socket? = null
+        @Volatile private var identity: Tls.Identity? = null
+
+
+        sealed interface Job
+        data class TextJob(val mime: String, val bytes: ByteArray) : Job
+        data class FileJob(
+            val uri: Uri,
+            val name: String,
+            val sizeKnown: Boolean,
+            val size: Long,
+        ) : Job
+
+        class FileResult(val status: Int, val sha256: ByteArray?)
+
+        fun enqueueText(context: Context, text: String) {
+            val bytes = text.toByteArray(Charsets.UTF_8)
+            if (bytes.size > Proto.MAX_TEXT) {
+                event("文本超过 4 MiB，跳过")
+                return
+            }
+            // 文本条目合并：剪贴板语义天然只保留最新一条（协议 §8）
+            queue.removeAll { it is TextJob }
+            queue.add(TextJob("text/plain;charset=utf-8", bytes))
+            kick(context)
+        }
+
+        fun enqueueFile(context: Context, uri: Uri, name: String, sizeKnown: Boolean, size: Long) {
+            queue.add(FileJob(uri, name, sizeKnown, size))
+            kick(context)
+        }
+
+        fun startPairing(context: Context, code: String, host: String?) {
+            synchronized(PairCtl.lock) {
+                PairCtl.code = code
+                PairCtl.host = host?.takeIf { it.isNotBlank() }
+                PairCtl.result = null
+                PairCtl.request = true
+            }
+            kick(context, hard = true)
+        }
+
+        /** nudge：立即全速重拨；hard=true 时先掐断现有连接（配对必须重建 TLS）。 */
+        private fun kick(context: Context, hard: Boolean = false) {
+            nudge = true
+            if (hard) runCatching { currentSocket?.close() }
+            runCatching { context.startForegroundService(Intent(context, SyncService::class.java)) }
+        }
+
+        @Volatile private var notifCtx: Context? = null
+
+        fun status(): String = statusText
+        fun event(): String = lastEvent
+        fun degradedPending(): Boolean = degradedCopy != null
+        fun degradedCopyText(): String? = degradedCopy
+
+        fun event(msg: String) {
+            Log.i(TAG, msg)
+            lastEvent = msg
+            notifCtx?.let { refreshNotification(it) }
+        }
+
+        fun updateStatus(ctx: Context, s: String) {
+            if (statusText == s && notifCtx != null) return
+            statusText = s
+            refreshNotification(ctx)
+        }
+
+        private fun refreshNotification(ctx: Context) {
+            runCatching {
+                (ctx.getSystemService(NotificationManager::class.java))
+                    .notify(NOTIFICATION_ID, buildNotif(ctx))
+            }
+        }
+
+        private fun buildNotif(ctx: Context): Notification {
+            val sync = PendingIntent.getActivity(
+                ctx, 0,
+                Intent(ctx, TrampolineActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            val copy = PendingIntent.getActivity(
+                ctx, 2,
+                Intent(ctx, TrampolineActivity::class.java)
+                    .putExtra(TrampolineActivity.EXTRA_WRITE_CLIP, true)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            val pair = PendingIntent.getActivity(
+                ctx, 3, Intent(ctx, PairActivity::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            val delete = PendingIntent.getBroadcast(
+                ctx, 1, Intent(ctx, DismissReceiver::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            val b = Notification.Builder(ctx, CHANNEL_ID)
+                .setContentTitle("Airpipe — $statusText")
+                .setContentText(lastEvent)
+                .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                .setContentIntent(pair)
+                .setOngoing(true)
+                .setDeleteIntent(delete)
+                .setOnlyAlertOnce(true)
+                .addAction(android.R.drawable.ic_menu_send, "立即同步", sync)
+            if (degradedCopy != null) b.addAction(android.R.drawable.ic_menu_edit, "复制", copy)
+            if (Store.load(ctx).isEmpty()) b.addAction(android.R.drawable.ic_menu_add, "配对", pair)
+            return b.build()
+        }
+    }
+
+    @Volatile private var alive = false
+    @Volatile private var sessionReady = false
+    @Volatile private var allowUnknownPeer = false
+    @Volatile private var peerFingerprint: String? = null
+    @Volatile private var peerName: String? = null
+    private val sendLock = Any()
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        // startForegroundService() 后必须尽快 startForeground()
+        notifCtx = applicationContext
+        startForeground(NOTIFICATION_ID, buildNotif(this))
+        alive = true
+        thread(name = "airpipe-loop") { clientLoop() }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Android 13+ 用户可划掉 FGS 通知而服务存活；onStartCommand 每次重挂通知
+        startForeground(NOTIFICATION_ID, buildNotif(this))
+        nudge = true
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        alive = false
+        runCatching { currentSocket?.close() }
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    // ---------------------------------------------------------------- loop
+
+    private fun clientLoop() {
+        // 身份证书：首次运行生成 + DER 自签自检，失败即抛（日志留证）
+        try {
+            identity = Tls.loadOrCreate(this, "airpipe/${android.os.Build.MODEL}")
+            Log.i(TAG, "身份就绪 fp=${identity!!.fingerprint}")
+        } catch (e: Exception) {
+            Log.e(TAG, "身份证书生成/自检失败，服务停摆", e)
+            updateStatus(this, "身份错误")
+            return
+        }
+        Store.load(this)
+
+        var backoffMs = 0L
+        while (alive) {
+            val pairReq = synchronized(PairCtl.lock) {
+                if (PairCtl.request) { PairCtl.request = false; true } else false
+            }
+            if (Store.load(this).isEmpty() && !pairReq) {
+                updateStatus(this, "未配对")
+                Thread.sleep(500)
+                continue
+            }
+            if (backoffMs > 0) {
+                updateStatus(this, "退避等待中…")
+                val deadline = System.nanoTime() + backoffMs * 1_000_000
+                while (alive && !nudge && System.nanoTime() < deadline) Thread.sleep(200)
+                if (nudge) Log.i(TAG, "nudge：立即全速重拨")
+                nudge = false
+            }
+
+            // 目标地址：配对手动 IP > 缓存地址 > UDP 发现
+            var target: String? = if (pairReq) PairCtl.host else pcHost
+            if (target == null) {
+                discoverPc()?.let { pcHost = it.first; pcPort = it.second }
+                target = pcHost
+            }
+            if (target == null) {
+                if (pairReq) finishPair(false, "未发现 PC（广播不可达时用手动 IP）")
+                backoffMs = nextBackoff(backoffMs)
+                continue
+            }
+            val port = if (pairReq && PairCtl.host != null) Proto.TCP_PORT else pcPort
+            try {
+                connectAndRun(target, port, pairReq)
+                backoffMs = 0
+            } catch (e: PairDone) {
+                // 配对连接由对端关闭（成功/失败都已上报），正常退避
+            } catch (e: IOException) {
+                Log.d(TAG, "连接结束(${e.message})")
+                if (pairReq) finishPair(false, "连接失败：${e.message}")
+                pcHost = null // 地址可能已失效（DHCP），下轮重新发现
+            }
+            backoffMs = nextBackoff(backoffMs)
+        }
+    }
+
+    private class PairDone : IOException()
+
+    private fun nextBackoff(cur: Long): Long =
+        if (cur < 500) Proto.BACKOFF_MIN else minOf(cur * 2, Proto.BACKOFF_MAX)
+
+    private fun connectAndRun(host: String, port: Int, pairReq: Boolean) {
+        updateStatus(this, "连接中…")
+        val trust = Tls.PinTrustManager(this, { allowUnknownPeer }) { fp ->
+            peerFingerprint = fp
+        }
+        allowUnknownPeer = pairReq
+        val sslContext: SSLContext = Tls.newClientContext(identity!!, trust)
+
+        val raw = Socket().apply { tcpNoDelay = true }
+        currentSocket = raw
+        raw.connect(InetSocketAddress(host, port), 5_000)
+        val sock = raw.startHandshakeSsl(sslContext)
+        sock.soTimeout = Proto.SILENCE
+        Log.i(TAG, "TLS 已建立 peer=$host fp=${peerFingerprint?.let { Store.short(it) }}")
+
+        val out = DataOutputStream(BufferedOutputStream(sock.getOutputStream()))
+        val input = DataInputStream(BufferedInputStream(sock.getInputStream()))
+
+        // ---- 配对交换：Q → 等 A（成功后补发 HELLO 进入正常会话，协议 §4） ----
+        if (pairReq) {
+            sock.soTimeout = 65_000
+            val code = synchronized(PairCtl.lock) { PairCtl.code }
+            synchronized(sendLock) {
+                Proto.writeFrame(out, Proto.F_PAIR_REQUEST,
+                    Proto.pairRequestPayload(code, android.os.Build.MODEL))
+                out.flush()
+            }
+            val (type, payload) = Proto.readFrame(input)
+            when (type) {
+                Proto.F_PAIR_ACCEPT -> {
+                    val pcName = Proto.parseName(payload)
+                    val fp = peerFingerprint!!
+                    Store.add(this, pcName, fp, host)
+                    event("配对成功：$pcName (${Store.short(fp)})")
+                    finishPair(true, "已配对 $pcName")
+                    pcHost = host
+                    pcPort = port
+                    updateSeen(fp, host)
+                }
+                Proto.F_BYE -> {
+                    finishPair(false, "被拒：${String(payload.copyOfRange(1, payload.size))}")
+                    throw PairDone()
+                }
+                else -> { finishPair(false, "配对应答异常 0x${type.toString(16)}"); throw PairDone() }
+            }
+        } else {
+            val fp = peerFingerprint!!
+            if (!Store.isPaired(this, fp)) {
+                Log.w(TAG, "未配对指纹 ${Store.short(fp)}，断开")
+                runCatching { sock.close() }
+                throw IOException("unpaired peer")
+            }
+            updateSeen(fp, host)
+        }
+
+        // ---- HELLO 互发（ver 不符收 BYE，协议 §5） ----
+        sessionReady = false
+        peerName = null
+        synchronized(sendLock) {
+            Proto.writeFrame(out, Proto.F_HELLO, Proto.helloPayload(android.os.Build.MODEL, CAPS))
+            out.flush()
+        }
+        val reader = thread(name = "airpipe-reader") {
+            readLoop(sock, out, host)
+            // 读流终结 = 连接已死：促 writer 退出去重拨
+            runCatching { sock.close() }
+            synchronized(resultLock) {
+                fileResults.values.forEach { it.completeExceptionally(EOF()) }
+                fileResults.clear()
+            }
+        }
+        try {
+            writerLoop(sock, out)
+        } finally {
+            runCatching { sock.close() }
+            runCatching { reader.interrupt() }
+        }
+    }
+
+    private fun Socket.startHandshakeSsl(sc: SSLContext): SSLSocket =
+        sc.socketFactory.createSocket(this, this.inetAddress.hostAddress, this.port, true) as SSLSocket
+
+    private class EOF : IOException("connection closed")
+
+    private fun updateSeen(fp: String, host: String) = runCatching { Store.updateSeen(this, fp, host) }
+
+    private fun finishPair(ok: Boolean, msg: String) {
+        event(msg)
+        synchronized(PairCtl.lock) {
+            PairCtl.result = ok to msg
+            PairCtl.host = null
+            (PairCtl.lock as Object).notifyAll()
+        }
+    }
+
+    /** UDP 广播发现（协议 §2）：应答源地址即 PC IP，返回 (host, tcpPort)。 */
+    private fun discoverPc(): Pair<String, Int>? = runCatching {
+        updateStatus(this, "发现中…")
+        DatagramSocket().use { ds ->
+            ds.broadcast = true
+            ds.soTimeout = 800
+            val msg = "AIRPIPE_DISCOVER ${Proto.VER}".toByteArray()
+            repeat(3) {
+                runCatching {
+                    ds.send(DatagramPacket(msg, msg.size,
+                        InetAddress.getByName("255.255.255.255"), Proto.DISCOVER_PORT))
+                }
+                try {
+                    val buf = ByteArray(128)
+                    val resp = DatagramPacket(buf, buf.size)
+                    ds.receive(resp)
+                    val parts = String(resp.data, 0, resp.length).trim().split(" ")
+                    if (parts.size == 4 && parts[0] == "AIRPIPE_PC" && parts[1].toInt() == Proto.VER) {
+                        val host = resp.address?.hostAddress ?: return@runCatching null
+                        val port = parts[2].toIntOrNull() ?: Proto.TCP_PORT
+                        Log.i(TAG, "UDP 发现 PC $host:$port fp=${parts[3]}")
+                        return host to port
+                    }
+                } catch (_: SocketTimeoutException) {
+                }
+            }
+            null
+        }
+    }.getOrNull()
+
+    // ---------------------------------------------------------------- writer
+
+    private fun writerLoop(sock: SSLSocket, out: DataOutputStream) {
+        // 等 HELLO 对端帧到达（reader 校验 ver 后置位）
+        val deadline = System.nanoTime() + 10_000_000_000L
+        while (alive && !sessionReady && System.nanoTime() < deadline) Thread.sleep(50)
+        if (!sessionReady) throw IOException("peer HELLO timeout")
+        updateStatus(this, "已连接 ${peerName ?: pcHost ?: ""}")
+
+        var nextId = 1
+        while (alive && !sock.isClosed) {
+            val job = queue.peek() ?: run { Thread.sleep(50); null } ?: continue
+            when (job) {
+                is TextJob -> {
+                    synchronized(sendLock) {
+                        Proto.writeFrame(out, Proto.F_TEXT, Proto.clipPayload(job.mime, job.bytes))
+                        out.flush()
+                    }
+                    queue.poll()
+                    event("已推送剪贴板文本 ${job.bytes.size}B")
+                }
+                is FileJob -> {
+                    var ok = false
+                    var rejected = false
+                    repeat(2) { // sha 不符整文件重发一次（协议 §6）
+                        when (sendOneFile(out, job, nextId++)) {
+                            SendOutcome.OK -> { ok = true; return@repeat }
+                            SendOutcome.HASH_MISMATCH -> {}
+                            SendOutcome.PEER_REJECTED -> { rejected = true; return@repeat }
+                        }
+                    }
+                    when {
+                        ok -> queue.poll()
+                        rejected -> queue.poll() // 对端 IO/取消：重发无益，终态放弃
+                        else -> { // 重发一次仍不符：放弃并通知用户
+                            queue.poll()
+                            event("文件发送失败（校验不符）：${job.name}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private enum class SendOutcome { OK, HASH_MISMATCH, PEER_REJECTED }
+
+    /** 发送单文件（B → D… → E → 等 F）。连接级错误抛 IOException（任务留队重拨补发）。 */
+    private fun sendOneFile(out: DataOutputStream, job: FileJob, id: Int): SendOutcome {
+        val future = CompletableFuture<FileResult>()
+        synchronized(resultLock) { fileResults[id] = future }
+
+        val flags = if (job.sizeKnown) 0 else Proto.FLAG_SIZE_UNKNOWN
+        synchronized(sendLock) {
+            Proto.writeFrame(out, Proto.F_FILE_BEGIN,
+                Proto.fileBeginPayload(id, flags, job.name, if (job.sizeKnown) job.size else 0L))
+        }
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buf = ByteArray(Proto.CHUNK)
+        contentResolver.openInputStream(job.uri)?.use { ins ->
+            while (true) {
+                val n = ins.read(buf)
+                if (n < 0) break
+                if (n > 0) {
+                    digest.update(buf, 0, n)
+                    val data = if (n == buf.size) buf else buf.copyOf(n)
+                    // 契约 §5：D 帧载荷 = id u32 + data（接收方按此解析）
+                    val p = ByteArray(4 + data.size)
+                    p[0] = (id ushr 24).toByte(); p[1] = (id ushr 16).toByte()
+                    p[2] = (id ushr 8).toByte(); p[3] = id.toByte()
+                    data.copyInto(p, 4)
+                    synchronized(sendLock) { Proto.writeFrame(out, Proto.F_FILE_DATA, p) }
+                }
+            }
+        } ?: throw IOException("openInputStream failed: ${job.uri}")
+        synchronized(sendLock) {
+            Proto.writeFrame(out, Proto.F_FILE_END, Proto.idPayload(id))
+            out.flush()
+        }
+        val localSha = digest.digest()
+
+        val result = try {
+            future.get(120, TimeUnit.SECONDS)
+        } catch (e: Exception) {
+            throw IOException("file result wait failed: ${e.message}")
+        } finally {
+            synchronized(resultLock) { fileResults.remove(id) }
+        }
+        return when {
+            result.status == Proto.FSTATUS_OK &&
+                result.sha256?.contentEquals(localSha) == true -> {
+                event("文件已送达：${job.name}")
+                SendOutcome.OK
+            }
+            result.status == Proto.FSTATUS_IO || result.status == Proto.FSTATUS_CANCELLED -> {
+                event("对端拒收(status=${result.status})：${job.name}")
+                SendOutcome.PEER_REJECTED
+            }
+            else -> {
+                Log.w(TAG, "sha256 不符，整文件重发：${job.name}")
+                SendOutcome.HASH_MISMATCH
+            }
+        }
+    }
+
+
+    // ---------------------------------------------------------------- reader
+
+    private class Inbound(
+        val id: Int,
+        val file: File,
+        val stream: FileOutputStream,
+        val digest: java.security.MessageDigest,
+        var bytes: Long = 0,
+        var sinceProgress: Long = 0,
+        var failed: Boolean = false,
+    )
+
+    private fun readLoop(sock: SSLSocket, out: DataOutputStream, host: String) {
+        val input = DataInputStream(BufferedInputStream(sock.getInputStream()))
+        val transfers = HashMap<Int, Inbound>()
+        try {
+            while (true) {
+                val (type, payload) = Proto.readFrame(input)
+                when (type) {
+                    Proto.F_HELLO -> {
+                        val (ver, name, _) = Proto.parseHello(payload)
+                        if (ver != Proto.VER) {
+                            synchronized(sendLock) {
+                                Proto.writeFrame(out, Proto.F_BYE, Proto.byePayload("version mismatch"))
+                                out.flush()
+                            }
+                            Log.w(TAG, "对端 HELLO ver=$ver 不符，BYE")
+                            return
+                        }
+                        peerName = name
+                        sessionReady = true
+                        Log.i(TAG, "对端 HELLO ok: $name")
+                    }
+                    Proto.F_PING -> synchronized(sendLock) {
+                        Proto.writeFrame(out, Proto.F_PONG); out.flush()
+                    }
+                    Proto.F_TEXT -> handleClipText(payload)
+                    Proto.F_IMAGE -> handleClipImage(payload)
+                    Proto.F_FILE_BEGIN -> beginInbound(payload, transfers)
+                    Proto.F_FILE_DATA -> {
+                        val t = transfers[payload.readInt0()] ?: continue
+                        if (t.failed) continue
+                        try {
+                            t.stream.write(payload, 4, payload.size - 4)
+                            t.digest.update(payload, 4, payload.size - 4)
+                            t.bytes += payload.size - 4
+                            t.sinceProgress += payload.size - 4
+                            if (t.sinceProgress >= Proto.PROGRESS_EVERY) {
+                                t.sinceProgress = 0
+                                synchronized(sendLock) {
+                                    Proto.writeFrame(out, Proto.F_FILE_PROGRESS,
+                                        Proto.progressPayload(t.id, t.bytes)); out.flush()
+                                }
+                            }
+                        } catch (e: IOException) {
+                            t.failed = true
+                            runCatching { t.stream.close() }; runCatching { t.file.delete() }
+                            event("写入失败：${t.file.name}（${e.message}）")
+                            synchronized(sendLock) {
+                                Proto.writeFrame(out, Proto.F_FILE_RESULT,
+                                    Proto.fileResultPayload(t.id, Proto.FSTATUS_IO, null))
+                                Proto.writeFrame(out, Proto.F_CANCEL, Proto.idPayload(t.id))
+                                out.flush()
+                            }
+                        }
+                    }
+                    Proto.F_FILE_END -> endInbound(payload, transfers, out)
+                    Proto.F_FILE_RESULT -> {
+                        val id = payload.readInt0()
+                        val status = payload[4].toInt() and 0xFF
+                        val sha = payload.copyOfRange(5, 37)
+                        val fut = synchronized(resultLock) { fileResults[id] }
+                        fut?.complete(FileResult(status, sha))
+                    }
+                    Proto.F_CANCEL -> {
+                        val t = transfers[payload.readInt0()] ?: continue
+                        t.failed = true
+                        runCatching { t.stream.close() }; runCatching { t.file.delete() }
+                        transfers.remove(t.id)
+                    }
+                    Proto.F_BYE -> {
+                        Log.i(TAG, "对端 BYE：${payload.drop(1).toByteArray().toString(Charsets.UTF_8)}")
+                        return
+                    }
+                    else -> {
+                        Log.w(TAG, "未知帧 0x${type.toString(16)}，忽略")
+                    }
+                }
+            }
+        } catch (_: InterruptedException) {
+        } catch (e: SocketTimeoutException) {
+            Log.w(TAG, "看门狗触发：${Proto.SILENCE / 1000}s 无对端字节，断开死链")
+        } catch (e: IOException) {
+            Log.d(TAG, "入站连接结束: ${e.message}")
+        } finally {
+            transfers.values.forEach {
+                runCatching { it.stream.close() }
+                // 传输中断：.part 半截文件永不暴露正式名，直接清理
+                runCatching { File(it.file.parentFile, it.file.name + ".part").delete() }
+            }
+        }
+    }
+
+    private fun ByteArray.readInt0(): Int =
+        ((this[0].toInt() and 0xFF) shl 24) or ((this[1].toInt() and 0xFF) shl 16) or
+            ((this[2].toInt() and 0xFF) shl 8) or (this[3].toInt() and 0xFF)
+
+    private fun beginInbound(payload: ByteArray, transfers: HashMap<Int, Inbound>) {
+        val b = Proto.parseFileBegin(payload)
+        val clean = sanitizeRelPath(b.relPath) ?: return run {
+            Log.w(TAG, "B 帧路径消毒后为空，忽略")
+        }
+        val target = uniqueFile(File(RECEIVE_DIR, clean))
+        try {
+            if (b.flags and Proto.FLAG_DIRECTORY != 0) {
+                target.mkdirs()
+                event("已创建目录 ${target.name}")
+                return
+            }
+            target.parentFile?.mkdirs()
+            val part = File(target.parentFile, target.name + ".part")
+            transfers[b.id] = Inbound(
+                b.id, target,
+                FileOutputStream(part),
+                MessageDigest.getInstance("SHA-256"),
+            )
+        } catch (e: IOException) {
+            Log.w(TAG, "B 帧建文件失败: ${e.message}")
+        }
+    }
+
+    private fun endInbound(payload: ByteArray, transfers: HashMap<Int, Inbound>, out: DataOutputStream) {
+        val id = payload.readInt0()
+        val t = transfers.remove(id) ?: return
+        val part = File(t.file.parentFile, t.file.name + ".part")
+        runCatching { t.stream.close() }
+        if (t.failed) return
+        val sha = t.digest.digest()
+        try {
+            if (!part.renameTo(t.file)) throw IOException("rename failed")
+            MediaScannerConnectionCompat.scan(this, t.file)
+            event("收到文件：${t.file.name}（${t.bytes}B）")
+            synchronized(sendLock) {
+                Proto.writeFrame(out, Proto.F_FILE_RESULT,
+                    Proto.fileResultPayload(id, Proto.FSTATUS_OK, sha)); out.flush()
+            }
+        } catch (e: Exception) {
+            runCatching { part.delete() }
+            event("收件失败：${t.file.name}（${e.message}）")
+            synchronized(sendLock) {
+                Proto.writeFrame(out, Proto.F_FILE_RESULT,
+                    Proto.fileResultPayload(id, Proto.FSTATUS_IO, null)); out.flush()
+            }
+        }
+    }
+
+    /** relPath 消毒（协议 §7）：剥前导 /，弃 .. 与空段，其余保留。 */
+    private fun sanitizeRelPath(relPath: String): String? =
+        relPath.split('/').map { it.trimStart('\\') }
+            .filter { it.isNotEmpty() && it != "." && it != ".." }
+            .joinToString("/").ifEmpty { null }
+
+    /** 目标已存在 → 追加 " (1)"、"(2)"，不覆盖。 */
+    private fun uniqueFile(target: File): File {
+        if (!target.exists()) return target
+        val dot = target.name.lastIndexOf('.')
+        val base = if (dot > 0) target.name.substring(0, dot) else target.name
+        val ext = if (dot > 0) target.name.substring(dot) else ""
+        var i = 1
+        while (true) {
+            val cand = File(target.parentFile, "$base ($i)$ext")
+            if (!cand.exists()) return cand
+            i++
+        }
+    }
+
+    private object MediaScannerConnectionCompat {
+        fun scan(ctx: Context, f: File) {
+            runCatching {
+                android.media.MediaScannerConnection.scanFile(ctx, arrayOf(f.absolutePath), null, null)
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- clipboard
+
+    private fun clipboard(): android.content.ClipboardManager =
+        getSystemService(android.content.ClipboardManager::class.java)
+
+    private fun handleClipText(payload: ByteArray) {
+        val (_, data) = Proto.parseClip(payload)
+        val text = data.toString(Charsets.UTF_8)
+        try {
+            clipboard().setPrimaryClip(ClipData.newPlainText("airpipe", text))
+            event("已写入剪贴板（${data.size}B 文本）")
+            degradedCopy = null
+        } catch (e: Exception) {
+            Log.w(TAG, "写剪贴板失败，降级通知「复制」: ${e.message}")
+            degradedCopy = text
+            event("PC 文本到达，点通知「复制」写入")
+            refreshNotification(this)
+        }
+    }
+
+    private fun handleClipImage(payload: ByteArray) {
+        val (mime, data) = Proto.parseClip(payload)
+        if (payload.size > Proto.MAX_IMAGE) {
+            Log.w(TAG, "I 帧 ${payload.size}B 超 MAX_IMAGE，忽略")
+            return
+        }
+        try {
+            val ext = when {
+                mime.contains("png") -> "png"
+                mime.contains("webp") -> "webp"
+                mime.contains("gif") -> "gif"
+                else -> "jpg"
+            }
+            val name = "airpipe-${System.currentTimeMillis()}.$ext"
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                put(MediaStore.Images.Media.MIME_TYPE, if (mime.startsWith("image/")) mime else "image/$ext")
+            }
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                ?: throw IOException("MediaStore insert failed")
+            contentResolver.openOutputStream(uri)?.use { it.write(data) }
+                ?: throw IOException("openOutputStream failed")
+            val cd = ClipData(ClipDescription("airpipe", arrayOf(mime)), ClipData.Item(uri))
+            clipboard().setPrimaryClip(cd)
+            event("已写入剪贴板（图片 ${data.size}B）")
+        } catch (e: Exception) {
+            Log.w(TAG, "图片写剪贴板失败: ${e.message}")
+            event("PC 图片到达但写入剪贴板失败")
+        }
+    }
+
+
+    // ---------------------------------------------------------------- notification
+
+    private fun createNotificationChannel() {
+        val channel = NotificationChannel(
+            CHANNEL_ID, "Airpipe 同步守护", NotificationManager.IMPORTANCE_LOW,
+        )
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+    }
+}
