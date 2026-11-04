@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -14,13 +16,26 @@ android {
         // targetSdk 34 (Android 14): 强制 FGS 类型 + 通知运行时权限，
         // 避开 Android 15 的 dataSync 前台服务 6 小时超时
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.0.1"
+        versionCode = 3
+        versionName = "1.1.0"
     }
 
+    val keystoreProps = Properties().apply {
+        val f = rootProject.file("local.properties")
+        if (f.isFile) f.inputStream().use { load(it) }
+    }
+    signingConfigs {
+        create("release") {
+            storeFile = keystoreProps.getProperty("keystore.file")?.let { file(it) }
+            storePassword = keystoreProps.getProperty("keystore.password")
+            keyAlias = keystoreProps.getProperty("keystore.alias")
+            keyPassword = keystoreProps.getProperty("keystore.password")
+        }
+    }
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 
