@@ -174,7 +174,7 @@ class SyncService : Service() {
             val b = Notification.Builder(ctx, CHANNEL_ID)
                 .setContentTitle("Airpipe — $statusText")
                 .setContentText(lastEvent)
-                .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                .setSmallIcon(R.drawable.ic_stat_airpipe)
                 .setContentIntent(pair)
                 .setOngoing(true)
                 .setDeleteIntent(delete)
