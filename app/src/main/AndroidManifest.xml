@@ -31,6 +31,18 @@
             android:foregroundServiceType="dataSync"
             android:exported="false" />
 
+        <!-- 快捷设置磁贴：轮询总开关（开=后台轮询+常驻通知，关=全停） -->
+        <service
+            android:name=".SyncTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_stat_airpipe"
+            android:label="Airpipe 同步"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
         <!-- 唯一可见 UI（桌面图标入口）：配对 / 状态 / 权限引导 -->
         <activity
             android:name=".PairActivity"

@@ -12,6 +12,11 @@ class BootReceiver : BroadcastReceiver() {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED &&
             intent.action != Intent.ACTION_MY_PACKAGE_REPLACED
         ) return
+        // 总开关关闭：用户已表达「不轮询」，开机/覆盖安装也不自启
+        if (!Prefs.syncEnabled(context)) {
+            Log.i("Airpipe", "总开关关闭，跳过自启")
+            return
+        }
         Log.i("Airpipe", "自启 SyncService (${intent.action})")
         runCatching { context.startForegroundService(Intent(context, SyncService::class.java)) }
     }

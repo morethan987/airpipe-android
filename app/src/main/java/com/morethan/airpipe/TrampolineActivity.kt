@@ -29,8 +29,10 @@ class TrampolineActivity : Activity() {
             @Suppress("DEPRECATION")
             overridePendingTransition(0, 0)
         }
-        // 冷启动兜底：确保服务挂着
-        runCatching { startForegroundService(Intent(this, SyncService::class.java)) }
+        // 冷启动兜底：确保服务挂着（总开关关闭时不拉，避免复活）
+        if (Prefs.syncEnabled(this)) {
+            runCatching { startForegroundService(Intent(this, SyncService::class.java)) }
+        }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {

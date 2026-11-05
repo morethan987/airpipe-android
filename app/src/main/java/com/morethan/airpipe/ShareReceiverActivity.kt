@@ -27,6 +27,15 @@ class ShareReceiverActivity : Activity() {
             @Suppress("DEPRECATION")
             overridePendingTransition(0, 0)
         }
+        // 总开关关闭：分享无处可送（服务停着），显式提示后放弃，不复活服务
+        if (!Prefs.syncEnabled(this)) {
+            Log.w(TAG, "总开关关闭，忽略分享")
+            android.widget.Toast.makeText(
+                this, "Airpipe 同步已关闭，请先在下拉磁贴或 App 内开启", android.widget.Toast.LENGTH_LONG
+            ).show()
+            finish()
+            return
+        }
         // 分享可能发生在服务未启动时（冷启动），先确保常驻服务挂起
         runCatching { startForegroundService(Intent(this, SyncService::class.java)) }
 

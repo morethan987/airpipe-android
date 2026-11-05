@@ -1,6 +1,6 @@
 # Airpipe Android 端行为设计
 
-**版本 v1（草案，待实现校准）** · 帧与加密语义见根仓库 `docs/protocol.md`；本文定义移动端行为、性能与稳定性设计。实现变动须同步更新本文并记入文末。
+**版本 v1.2（草案，待实现校准）** · 帧与加密语义见根仓库 `docs/protocol.md`；本文定义移动端行为、性能与稳定性设计。实现变动须同步更新本文并记入文末。
 
 ## 技术约束（探针实测结论，全部已在 Redmi Note 13 Pro / HyperOS 真机验证）
 
@@ -15,13 +15,25 @@
 | 组件 | 职责 |
 | :--- | :--- |
 | `SyncService` | FGS 常驻。TLS 客户端连接循环、退避重拨、心跳看门狗、收发帧、出站队列、自动写剪贴板、常驻通知 |
+| `SyncTileService` | 快捷设置磁贴（Clash 式）：轮询总开关。开 = 后台轮询 + 常驻通知；关 = 停 SyncService 全停 |
+| `Prefs` | 轻量持久化：`sync_enabled` 总开关（默认开），磁贴 / App 按钮 / 各自启入口共用 |
 | `TrampolineActivity` | 透明蹦床：焦点瞬间读剪贴板（文本 / 文件 URI）→ 入队 → 自毁。点击常驻通知触发（通知即同步，不开 App） |
 | `ShareReceiverActivity` | `ACTION_SEND` / `SEND_MULTIPLE` 分享接收：流式读 URI 入队，零 UI |
-| `PairActivity` | **唯一可见 UI**（同时是桌面图标入口）：连接状态、6 位码输入、手动 IP（高级）、已配对 PC 列表 / 取消配对、权限引导 |
+| `PairActivity` | **唯一可见 UI**（同时是桌面图标入口）：连接状态、轮询总开关、6 位码输入、手动 IP（高级）、已配对 PC 列表 / 取消配对、权限引导 |
 | `BootReceiver` | 开机自启 SyncService（RECEIVE_BOOT_COMPLETED；HyperOS 还需用户开「自启动」） |
 | `DismissReceiver` | 常驻通知被划掉 → 重拉服务重挂通知 |
 
 零三方依赖（纯框架 API），minSdk 29 / targetSdk 34，`applicationId = com.morethan.airpipe`。
+
+## 轮询总开关（磁贴）
+
+- 入口两处，同走 `SyncService.setSyncEnabled`，状态持久化（`Prefs.sync_enabled`，默认开保持既有行为）：
+  ① 下拉快捷设置磁贴「Airpipe 同步」（长按下拉面板 → 编辑磁贴 → 拖入，一次性操作）；
+  ② PairActivity「轮询同步」按钮。
+- **开** = 现状不变：后台自动连接 PC + 常驻通知。
+- **关** = 停 SyncService，轮询与常驻通知一并消失（省电）。所有复活路径统一过 `Prefs.syncEnabled` 闸门，无死角：
+  `kick()` 不拉服务（分享滞队随进程死即丢，分享侧 Toast 显式提示）、`onCreate/onStartCommand` 满足 FGS 契约后立即自灭、`refreshNotification` 静默跳过、开机 / 覆盖安装 / 通知划掉兜底均不自启。
+- 例外：**配对 = 明确要同步**，提交配对码时若总开关关闭则顺带打开，否则配对永远无响应。
 
 ## 连接管理（SyncService 核心）
 
@@ -63,7 +75,7 @@
 ## 通知设计（单条常驻通知）
 
 ```
-标题：Airpipe — 已连接 <PC名>   （连接中… / 未配对 / 退避等待中…）
+标题：Airpipe — 已连接 <PC名>   （连接中… / 未配对 / 退避等待中… / 同步已关闭）
 正文：传输中为「文件名 + 百分比」并挂进度条（发送按已发字节、接收按已收字节，
       300ms 节流；总量未知时转圈）；空闲时为最近事件
 点击通知 = 立即同步               ← contentIntent → 蹦床读剪贴板入队发 PC，不开 App
@@ -74,6 +86,7 @@
 
 - `IMPORTANCE_LOW`（无声）；`foregroundServiceType = dataSync`。
 - deleteIntent → DismissReceiver 复活（Android 13+ 可划掉的 FGS 通知）。
+- 总开关关闭时通知随服务一并消失（见「轮询总开关」节）。
 
 ## 性能与稳定性清单
 
@@ -86,6 +99,7 @@
 | 断线补发 | 出站引用队列 + 发送失败留队 + 重连清队 |
 | 冻结恢复 | START_STICKY + BootReceiver + deleteIntent 复活 + 用户 nudge 全速重拨 |
 | 交互延迟 | 分享/点通知在服务未起时冷启动挂服务（探针已验证路径） |
+| 省电 | 总开关关闭 = 服务全停（不轮询 / 无通知 / 不自启），磁贴一键切换 |
 
 ## 权限与一次性授权仪式
 
@@ -98,7 +112,7 @@ MANAGE_EXTERNAL_STORAGE      <!-- 写 /storage/emulated/0/Airpipe -->
 RECEIVE_BOOT_COMPLETED
 ```
 
-装机后：①PairActivity 引导页点「开启存储权限」跳系统「所有文件访问」页，用户手开（普通用户无需 adb）；②手动开通知权限；③省电策略「无限制」+ 自启动（引导页分步列出）。
+装机后：①PairActivity 引导页点「开启存储权限」跳系统「所有文件访问」页，用户手开（普通用户无需 adb）；②手动开通知权限；③省电策略「无限制」+ 自启动（引导页分步列出）；④（可选）下拉编辑磁贴拖入「Airpipe 同步」。
 
 ## 已知限制
 
@@ -108,4 +122,5 @@ RECEIVE_BOOT_COMPLETED
 
 ## 变更日志
 
+- 2026-11-05 v1.2.0 新增轮询总开关：快捷设置磁贴 `SyncTileService` + App 内按钮；关闭时全停（不轮询 / 无常驻通知 / 开机与覆盖安装不自启 / 分享不复活），配对自动打开。
 - 2026-11-04 v1 初稿（审议中）

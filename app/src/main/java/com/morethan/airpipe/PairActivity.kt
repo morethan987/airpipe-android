@@ -33,6 +33,8 @@ class PairActivity : Activity() {
     private lateinit var codeInput: EditText
     private lateinit var ipInput: EditText
     private lateinit var pairButton: Button
+    private lateinit var syncStatus: TextView
+    private lateinit var syncButton: Button
     private lateinit var pairedBox: LinearLayout
     private lateinit var permStatus: TextView
     private lateinit var notifStatus: TextView
@@ -46,7 +48,10 @@ class PairActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(buildUi())
-        runCatching { startForegroundService(android.content.Intent(this, SyncService::class.java)) }
+        // 总开关关闭时打开 App 不复活服务（打开 ≠ 要同步）
+        if (Prefs.syncEnabled(this)) {
+            runCatching { startForegroundService(android.content.Intent(this, SyncService::class.java)) }
+        }
     }
 
     override fun onResume() {
@@ -82,7 +87,11 @@ class PairActivity : Activity() {
         }
     }
 
-    private fun refresh() {
+     private fun refresh() {
+        val on = Prefs.syncEnabled(this)
+        syncStatus.text = if (on) "✅ 开启——后台自动连接 PC，常驻通知显示"
+        else "⏸ 已关闭——暂停轮询与常驻通知（省电），可从下拉磁贴或此处开启"
+        syncButton.text = if (on) "关闭轮询同步" else "开启轮询同步"
         statusView.text = "状态：${SyncService.status()}"
         eventView.text = "最近事件：${SyncService.event()}"
         permStatus.text = "存储权限：${if (Environment.isExternalStorageManager()) "✅ 已开启" else "❌ 未开启（接收文件落盘需要）"}"
@@ -168,6 +177,17 @@ class PairActivity : Activity() {
         root.addView(gap()); root.addView(title("状态"))
         statusView = body("").also { root.addView(it) }
         eventView = body("").also { root.addView(it) }
+
+        // 轮询总开关（与下拉磁贴同源同效）
+        root.addView(gap()); root.addView(title("轮询同步"))
+        syncStatus = body("").also { root.addView(it) }
+        syncButton = Button(this).apply {
+            setOnClickListener {
+                SyncService.setSyncEnabled(this@PairActivity, !Prefs.syncEnabled(this@PairActivity))
+                refresh()
+            }
+        }
+        root.addView(syncButton)
 
         // 配对区
         root.addView(gap()); root.addView(title("配对"))
@@ -275,6 +295,8 @@ class PairActivity : Activity() {
             return
         }
         pairButton.isEnabled = false
+        // 配对 = 明确要同步：总开关关闭时顺带打开（否则 kick 被闸，配对永远无响应）
+        if (!Prefs.syncEnabled(this)) SyncService.setSyncEnabled(this, true)
         SyncService.event("配对中…（确保 PC 已执行 ap pair）")
         SyncService.startPairing(this, code, ipInput.text.toString().trim())
     }

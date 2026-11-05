@@ -16,8 +16,8 @@ android {
         // targetSdk 34 (Android 14): 强制 FGS 类型 + 通知运行时权限，
         // 避开 Android 15 的 dataSync 前台服务 6 小时超时
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.1.0"
+        versionCode = 4
+        versionName = "1.2.0"
     }
 
     val keystoreProps = Properties().apply {

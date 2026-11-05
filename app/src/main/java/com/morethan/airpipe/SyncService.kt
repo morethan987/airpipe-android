@@ -118,9 +118,30 @@ class SyncService : Service() {
 
         /** nudge：立即全速重拨；hard=true 时先掐断现有连接（配对必须重建 TLS）。 */
         private fun kick(context: Context, hard: Boolean = false) {
+            // 总开关关闭时任何入队/nudge 都不拉服务（分享侧有 Toast 显式提示）
+            if (!Prefs.syncEnabled(context)) return
             nudge = true
             if (hard) runCatching { currentSocket?.close() }
             runCatching { context.startForegroundService(Intent(context, SyncService::class.java)) }
+        }
+
+        /**
+         * 轮询总开关（磁贴 / App 按钮共用）：开 = 拉起常驻服务；关 = 停服务，
+         * 轮询与常驻通知一并消失。开机自启/通知划掉兜底/分享冷启动均先查 Prefs，不复活。
+         */
+        fun setSyncEnabled(ctx: Context, enabled: Boolean) {
+            Log.i(TAG, "总开关切换 → $enabled")
+            Prefs.setSyncEnabled(ctx, enabled)
+            if (enabled) {
+                runCatching { ctx.startForegroundService(Intent(ctx, SyncService::class.java)) }
+            } else {
+                statusText = "同步已关闭"
+                runCatching { ctx.stopService(Intent(ctx, SyncService::class.java)) }
+                // FGS 通知随服务销毁移除；兜底再撤一次（时序残影）
+                runCatching {
+                    ctx.getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
+                }
+            }
         }
 
         @Volatile private var notifCtx: Context? = null
@@ -164,6 +185,8 @@ class SyncService : Service() {
         }
 
         private fun refreshNotification(ctx: Context) {
+            // 总开关已关：静态入口（enqueue/event）不得复活通知
+            if (!Prefs.syncEnabled(ctx)) return
             runCatching {
                 (ctx.getSystemService(NotificationManager::class.java))
                     .notify(NOTIFICATION_ID, buildNotif(ctx))
@@ -239,11 +262,21 @@ class SyncService : Service() {
         // startForegroundService() 后必须尽快 startForeground()
         notifCtx = applicationContext
         startForeground(NOTIFICATION_ID, buildNotif(this))
+        // 总开关关闭（START_STICKY 复活/残留 start）：满足 FGS 契约后立即自灭
+        if (!Prefs.syncEnabled(this)) {
+            stopSelf()
+            return
+        }
         alive = true
         thread(name = "airpipe-loop") { clientLoop() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!Prefs.syncEnabled(this)) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
         // Android 13+ 用户可划掉 FGS 通知而服务存活；onStartCommand 每次重挂通知
         startForeground(NOTIFICATION_ID, buildNotif(this))
         nudge = true

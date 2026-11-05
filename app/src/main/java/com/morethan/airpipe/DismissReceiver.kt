@@ -12,6 +12,8 @@ import android.util.Log
  */
 class DismissReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        // 总开关关闭：可能是关闭瞬间的迟到 deleteIntent，不复活
+        if (!Prefs.syncEnabled(context)) return
         Log.d("Airpipe", "常驻通知被划掉，兜底重发")
         runCatching { context.startForegroundService(Intent(context, SyncService::class.java)) }
     }
