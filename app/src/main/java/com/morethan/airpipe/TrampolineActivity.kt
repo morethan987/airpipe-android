@@ -6,19 +6,25 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.util.Log
+import android.widget.Toast
+import java.io.File
 
 /**
  * 透明蹦床 —— 探针验证路径：Android 10+ 只有焦点窗口能读剪贴板，
  * onWindowFocusChanged(hasFocus=true) 是唯一可靠读取时点；读完成入队即自毁。
  * 另承担降级「复制」：把 PC 推来但自动写入失败的文本写进剪贴板（写免焦点）。
+ * 以及通知「收件目录」动作：拉起系统文件管理器直达收件目录（免焦点，onCreate 即办）。
  */
 class TrampolineActivity : Activity() {
 
     companion object {
         const val TAG = "Airpipe"
         const val EXTRA_WRITE_CLIP = "write_clip"
+        const val EXTRA_OPEN_DIR = "open_dir"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -29,9 +35,45 @@ class TrampolineActivity : Activity() {
             @Suppress("DEPRECATION")
             overridePendingTransition(0, 0)
         }
+        // 通知「收件目录」动作：直达文件管理器，不读剪贴板，无需等焦点
+        if (intent?.getBooleanExtra(EXTRA_OPEN_DIR, false) == true) {
+            openReceiveDir()
+            finish()
+            if (Build.VERSION.SDK_INT >= 34) {
+                overrideActivityTransition(OVERRIDE_TRANSITION_CLOSE, 0, 0)
+            } else {
+                @Suppress("DEPRECATION")
+                overridePendingTransition(0, 0)
+            }
+            return
+        }
         // 冷启动兜底：确保服务挂着（总开关关闭时不拉，避免复活）
         if (Prefs.syncEnabled(this)) {
             runCatching { startForegroundService(Intent(this, SyncService::class.java)) }
+        }
+    }
+
+    /**
+     * 收件目录 → 系统文件管理器：SAF 文档 URI（ExternalStorageProvider）+
+     * MIME_TYPE_DIR，直达 DocumentsUI。免存储权限、免 FileProvider；
+     * 不用 file:// + resource/folder（多数文件管理器不支持，Syncthing #838）。
+     */
+    private fun openReceiveDir() {
+        val dir = File(SyncService.RECEIVE_DIR)
+        runCatching { dir.mkdirs() }
+        runCatching {
+            val rel = dir.absolutePath
+                .removePrefix(Environment.getExternalStorageDirectory().absolutePath)
+                .trim('/')
+            val uri = DocumentsContract.buildDocumentUri(
+                "com.android.externalstorage.documents", "primary:$rel")
+            startActivity(Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, DocumentsContract.Document.MIME_TYPE_DIR)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            })
+        }.onFailure {
+            Log.w(TAG, "打开收件目录失败: ${it.message}")
+            Toast.makeText(this, "未找到可打开收件目录的文件管理器", Toast.LENGTH_LONG).show()
         }
     }
 

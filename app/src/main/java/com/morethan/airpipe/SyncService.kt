@@ -60,8 +60,10 @@ class SyncService : Service() {
     companion object {
         private const val TAG = "Airpipe"
         private const val CHANNEL_ID = "airpipe_channel"
+        private const val TRANSFER_CHANNEL_ID = "airpipe_transfer"
         private const val NOTIFICATION_ID = 1
-        private const val RECEIVE_DIR = "/storage/emulated/0/Airpipe"
+        private const val TRANSFER_NOTIFICATION_ID = 2
+        const val RECEIVE_DIR = "/storage/emulated/0/Airpipe"
         private const val CAPS = 0b111 // 文本 | 图片 | 文件
 
         // ---- 进程级共享状态（蹦床/分享/配对页在任意线程投递） ----
@@ -162,6 +164,8 @@ class SyncService : Service() {
                 runCatching {
                     ctx.getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
                 }
+                transfer = null
+                lastProgNotif = 0L
             }
         }
 
@@ -182,20 +186,34 @@ class SyncService : Service() {
         @Volatile private var transfer: Prog? = null
         @Volatile private var lastProgNotif = 0L
 
-        /** 传输进度上报（发送/接收共用），300ms 节流刷新常驻通知进度条。 */
+        /**
+         * 传输进度上报（发送/接收共用），300ms 节流刷新**独立**传输通知（KDE Connect
+         * 同款结构）：进度条与常驻通知（最近事件文字）分属两条通知，天然无交替闪烁。
+         */
         fun reportProgress(label: String, total: Long, done: Long) {
             transfer = Prog(label, total, done)
             val now = android.os.SystemClock.elapsedRealtime()
             if (now - lastProgNotif > 300) {
                 lastProgNotif = now
-                notifCtx?.let { refreshNotification(it) }
+                notifCtx?.let { ctx ->
+                    runCatching {
+                        ctx.getSystemService(NotificationManager::class.java)
+                            .notify(TRANSFER_NOTIFICATION_ID, buildTransferNotif(ctx))
+                    }
+                }
             }
         }
 
+        /** 传输结束：立即撤掉传输通知；完成结果由常驻通知的「最近事件」承载。 */
         fun clearTransfer() {
-            if (transfer != null) {
-                transfer = null
-                notifCtx?.let { refreshNotification(it) }
+            if (transfer == null) return
+            transfer = null
+            lastProgNotif = 0L
+            notifCtx?.let { ctx ->
+                runCatching {
+                    ctx.getSystemService(NotificationManager::class.java)
+                        .cancel(TRANSFER_NOTIFICATION_ID)
+                }
             }
         }
 
@@ -214,6 +232,7 @@ class SyncService : Service() {
             }
         }
 
+        /** 常驻通知：正文永远是「最近事件」，不挂进度条（进度在独立传输通知上）。 */
         private fun buildNotif(ctx: Context): Notification {
             // 点通知 = 同步（蹦床读剪贴板入队 + nudge），不开 App
             val sync = PendingIntent.getActivity(
@@ -235,6 +254,13 @@ class SyncService : Service() {
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
             )
+            val openDir = PendingIntent.getActivity(
+                ctx, 4,
+                Intent(ctx, TrampolineActivity::class.java)
+                    .putExtra(TrampolineActivity.EXTRA_OPEN_DIR, true)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
             val delete = PendingIntent.getBroadcast(
                 ctx, 1, Intent(ctx, DismissReceiver::class.java),
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
@@ -247,25 +273,39 @@ class SyncService : Service() {
                 .setOngoing(true)
                 .setDeleteIntent(delete)
                 .setOnlyAlertOnce(true)
-            val t = transfer
-            if (t != null) {
-                if (t.total > 0) {
-                    val pct = (t.done * 100 / t.total).toInt().coerceIn(0, 100)
-                    b.setContentText("${t.label}  $pct%")
-                    b.setProgress(100, pct, false)
-                } else {
-                    b.setContentText("${t.label}  传输中…")
-                    b.setProgress(0, 0, true)
-                }
-            } else {
-                b.setContentText(lastEvent)
-            }
+                // 常驻守护时间戳无意义；隐藏它减少高频更新时的行重排
+                .setShowWhen(false)
             if (Store.load(ctx).isEmpty()) {
                 b.addAction(android.R.drawable.ic_menu_add, "配对", openApp)
             } else {
-                b.addAction(android.R.drawable.ic_menu_compass, "打开", openApp)
+                b.addAction(android.R.drawable.ic_menu_compass, "打开应用", openApp)
             }
+            // SAF 文档 URI 直达系统文件管理器（DocumentsUI），无需文件管理器
+            // 支持 resource/folder（多数不支持，见 Syncthing #838）
+            b.addAction(R.drawable.ic_folder, "收件目录", openDir)
             if (degradedCopy != null) b.addAction(android.R.drawable.ic_menu_edit, "复制", copy)
+            return b.build()
+        }
+
+        /** 传输通知：独立 ID + 独立通道，传输期间存在，结束即撤。 */
+        private fun buildTransferNotif(ctx: Context): Notification {
+            val t = transfer ?: return Notification.Builder(ctx, TRANSFER_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_stat_airpipe)
+                .build()
+            val b = Notification.Builder(ctx, TRANSFER_CHANNEL_ID)
+                .setContentTitle("Airpipe — 传输中")
+                .setSmallIcon(R.drawable.ic_stat_airpipe)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .setShowWhen(false)
+            if (t.total > 0) {
+                val pct = (t.done * 100 / t.total).toInt().coerceIn(0, 100)
+                b.setContentText("${t.label}  $pct%")
+                b.setProgress(100, pct, false)
+            } else {
+                b.setContentText("${t.label}  传输中…")
+                b.setProgress(0, 0, true)
+            }
             return b.build()
         }
     }
@@ -559,10 +599,12 @@ class SyncService : Service() {
                             res.sha256?.contentEquals(inf.localSha) == true -> {
                             iter.remove()
                             event("文件已送达：${inf.job.name}")
+                            clearTransfer()
                         }
                         res.status == Proto.FSTATUS_IO || res.status == Proto.FSTATUS_CANCELLED -> {
                             iter.remove()
                             event("对端拒收(status=${res.status})：${inf.job.name}")
+                            clearTransfer()
                         }
                         inf.attempt == 0 -> { // sha 不符整文件重发一次（协议 §6）
                             iter.remove()
@@ -572,11 +614,13 @@ class SyncService : Service() {
                         else -> {
                             iter.remove()
                             event("文件发送失败（校验不符）：${inf.job.name}")
+                            clearTransfer()
                         }
                     }
                 }
-                if (pending.isEmpty() && retryQ.isEmpty() && queue.isEmpty()) clearTransfer()
-
+                // 发送完成已由收割分支 clearTransfer 撤除进度通知；此处不得再清：
+                // 接收文件时发送队列恒空，每 50ms 的清理会把接收进度通知反复
+                // 撤除（PC→手机方向因此无进度显示）
                 // 2) 派发：重发优先，随后队头。文本随时穿插（单写线程，发送仍保序），
                 //    文件受 SEND_WINDOW 约束；不可读（URI 授权失效/文件被删）终态放弃不堵队列
                 dispatch@ while (pending.size < SEND_WINDOW) {
@@ -675,7 +719,7 @@ class SyncService : Service() {
                         }
                         synchronized(sendLock) { Proto.writeFileData(out, id, z, wire) }
                         sent += n
-                        reportProgress(job.name, if (job.sizeKnown) job.size else -1L, sent)
+                        reportProgress("↑ ${job.name}", if (job.sizeKnown) job.size else -1L, sent)
                     }
                 }
             } ?: throw IOException("openInputStream failed: ${job.uri}")
@@ -759,7 +803,7 @@ class SyncService : Service() {
                             t.digest.update(data, off, len)
                             t.bytes += len
                             t.sinceProgress += len
-                            reportProgress(t.file.name, t.total, t.bytes)
+                            reportProgress("↓ ${t.file.name}", t.total, t.bytes)
                             if (t.sinceProgress >= Proto.PROGRESS_EVERY) {
                                 t.sinceProgress = 0
                                 synchronized(sendLock) {
@@ -792,6 +836,7 @@ class SyncService : Service() {
                         t.failed = true
                         runCatching { t.stream.close() }; runCatching { t.file.delete() }
                         transfers.remove(t.id)
+                        clearTransfer()
                     }
                     Proto.F_BYE -> {
                         Log.i(TAG, "对端 BYE：${payload.drop(1).toByteArray().toString(Charsets.UTF_8)}")
@@ -852,6 +897,8 @@ class SyncService : Service() {
     private fun endInbound(payload: ByteArray, transfers: HashMap<Int, Inbound>, out: DataOutputStream) {
         val id = payload.readInt0()
         val t = transfers.remove(id) ?: return
+        // E 帧即撤进度通知（cancel 幂等立即生效，无完成态渲染竞争）；
+        // 完成结果由常驻通知「最近事件」承载
         clearTransfer()
         val part = File(t.file.parentFile, t.file.name + ".part")
         runCatching { t.stream.close() }
@@ -958,9 +1005,12 @@ class SyncService : Service() {
     // ---------------------------------------------------------------- notification
 
     private fun createNotificationChannel() {
-        val channel = NotificationChannel(
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(NotificationChannel(
             CHANNEL_ID, "Airpipe 同步守护", NotificationManager.IMPORTANCE_LOW,
-        )
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        ))
+        nm.createNotificationChannel(NotificationChannel(
+            TRANSFER_CHANNEL_ID, "Airpipe 传输进度", NotificationManager.IMPORTANCE_LOW,
+        ))
     }
 }
