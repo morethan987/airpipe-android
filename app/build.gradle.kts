@@ -16,8 +16,8 @@ android {
         // targetSdk 34 (Android 14): 强制 FGS 类型 + 通知运行时权限，
         // 避开 Android 15 的 dataSync 前台服务 6 小时超时
         targetSdk = 34
-        versionCode = 4
-        versionName = "1.2.0"
+        versionCode = 5
+        versionName = "1.3.0"
     }
 
     val keystoreProps = Properties().apply {
@@ -52,5 +52,7 @@ kotlin {
 }
 
 dependencies {
-    // 纯框架 API，零 AndroidX、零三方依赖
+    // 纯框架 API，零 AndroidX；zstd-jni 是唯一的三方依赖（v2 传输压缩，
+    // AAR 内置各 ABI 的 libzstd.so，见 docs/transfer-perf.md §7）
+    implementation("com.github.luben:zstd-jni:1.5.7-1@aar")
 }

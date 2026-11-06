@@ -14,6 +14,7 @@ import android.net.Uri
 import android.os.IBinder
 import android.provider.MediaStore
 import android.util.Log
+import com.github.luben.zstd.Zstd
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.DataInputStream
@@ -88,6 +89,26 @@ class SyncService : Service() {
         ) : Job
 
         class FileResult(val status: Int, val sha256: ByteArray?)
+
+        // 文件级流水线窗口（协议 §6）：E 已发而 F 未回的文件数上限。
+        // 消除逐文件 RTT+落盘串行（transfer-perf.md §4：小文件一半耗时在等 F）
+        const val SEND_WINDOW = 4
+
+        // v2 传输压缩：与 PC transfer.rs INCOMPRESSIBLE 同步的熵编码扩展名表
+        // （zstd 对其纯烧 CPU，实测比率 1.000）；小写比较
+        private val INCOMPRESSIBLE = setOf(
+            "zip", "rar", "7z", "gz", "xz", "zst", "bz2", "br", "lz4", "sz", "tgz", "tbz2", "txz", "crx",
+            "png", "jpg", "jpeg", "webp", "gif", "heic", "heif", "avif", "jxl",
+            "mp4", "mov", "mkv", "webm", "avi", "m4v", "3gp", "mpeg", "mpg", "ts", "flv", "wmv",
+            "mp3", "m4a", "aac", "flac", "ogg", "opus", "wma", "ape", "mka",
+            "apk", "aab", "jar", "dex", "docx", "xlsx", "pptx", "epub", "cbz", "iso", "dmg", "deb", "rpm",
+        )
+
+        /** 出站文件是否值得压缩（auto 策略：仅按扩展名跳过已熵编码格式）。 */
+        fun shouldCompress(name: String): Boolean {
+            val ext = name.substringAfterLast('.', "").lowercase()
+            return ext.isEmpty() || ext !in INCOMPRESSIBLE
+        }
 
         fun enqueueText(context: Context, text: String) {
             val bytes = text.toByteArray(Charsets.UTF_8)
@@ -518,115 +539,154 @@ class SyncService : Service() {
         updateStatus(this, "已连接 ${peerName ?: pcHost ?: ""}")
 
         var nextId = 1
-        while (alive && !sock.isClosed) {
-            val job = queue.peek() ?: run { Thread.sleep(50); null } ?: continue
-            when (job) {
-                is TextJob -> {
-                    synchronized(sendLock) {
-                        Proto.writeFrame(out, Proto.F_TEXT, Proto.clipPayload(job.mime, job.bytes))
-                        out.flush()
+        val pending = ArrayDeque<PendingSend>() // 在途：E 已发，F 未回
+        val retryQ = ArrayDeque<FileJob>()      // sha 不符，待整文件重发一次
+        try {
+            while (alive && !sock.isClosed) {
+                // 1) 收割完成的结果（readLoop 收 F 后补全 future）
+                val iter = pending.iterator()
+                while (iter.hasNext()) {
+                    val inf = iter.next()
+                    if (!inf.future.isDone) continue
+                    val res = try {
+                        inf.future.get()
+                    } catch (e: Exception) {
+                        throw IOException("file result wait failed: ${e.message}")
                     }
-                    queue.poll()
-                    event("已推送剪贴板文本 ${job.bytes.size}B")
-                }
-                is FileJob -> {
-                    // 不可读（URI 授权失效 / 文件被删）：终态放弃，别堵死队列
-                    if (!runCatching {
-                            contentResolver.openInputStream(job.uri)?.close()
-                            true
-                        }.getOrDefault(false)) {
-                        queue.poll()
-                        event("文件不可读，已跳过：${job.name}")
-                        clearTransfer()
-                        continue
-                    }
-                    var ok = false
-                    var rejected = false
-                    var attempt = 0
-                    // sha 不符整文件重发一次（协议 §6）。注意：repeat + return@repeat
-                    // 只退出当次 lambda，循环照走——曾导致每个文件都发两遍（真机复现）。
-                    while (attempt < 2 && !ok && !rejected) {
-                        attempt++
-                        when (sendOneFile(out, job, nextId++)) {
-                            SendOutcome.OK -> ok = true
-                            SendOutcome.HASH_MISMATCH -> {}
-                            SendOutcome.PEER_REJECTED -> rejected = true
-                        }
-                    }
-                    clearTransfer()
+                    synchronized(resultLock) { fileResults.remove(inf.id) }
                     when {
-                        ok -> queue.poll()
-                        rejected -> queue.poll() // 对端 IO/取消：重发无益，终态放弃
-                        else -> { // 重发一次仍不符：放弃并通知用户
-                            queue.poll()
-                            event("文件发送失败（校验不符）：${job.name}")
+                        res.status == Proto.FSTATUS_OK &&
+                            res.sha256?.contentEquals(inf.localSha) == true -> {
+                            iter.remove()
+                            event("文件已送达：${inf.job.name}")
+                        }
+                        res.status == Proto.FSTATUS_IO || res.status == Proto.FSTATUS_CANCELLED -> {
+                            iter.remove()
+                            event("对端拒收(status=${res.status})：${inf.job.name}")
+                        }
+                        inf.attempt == 0 -> { // sha 不符整文件重发一次（协议 §6）
+                            iter.remove()
+                            Log.w(TAG, "sha256 不符，整文件重发：${inf.job.name}")
+                            retryQ.addLast(inf.job)
+                        }
+                        else -> {
+                            iter.remove()
+                            event("文件发送失败（校验不符）：${inf.job.name}")
                         }
                     }
                 }
+                if (pending.isEmpty() && retryQ.isEmpty() && queue.isEmpty()) clearTransfer()
+
+                // 2) 派发：重发优先，随后队头。文本随时穿插（单写线程，发送仍保序），
+                //    文件受 SEND_WINDOW 约束；不可读（URI 授权失效/文件被删）终态放弃不堵队列
+                dispatch@ while (pending.size < SEND_WINDOW) {
+                    val retryJob = retryQ.removeFirstOrNull()
+                    if (retryJob != null) {
+                        val inf = try {
+                            startFile(out, retryJob, nextId++, 1)
+                        } catch (e: IOException) {
+                            retryQ.addFirst(retryJob); throw e
+                        }
+                        pending.addLast(inf)
+                        continue@dispatch
+                    }
+                    when (val head = queue.peek() ?: break@dispatch) {
+                        is TextJob -> {
+                            synchronized(sendLock) {
+                                Proto.writeFrame(out, Proto.F_TEXT, Proto.clipPayload(head.mime, head.bytes))
+                                out.flush()
+                            }
+                            queue.poll()
+                            event("已推送剪贴板文本 ${head.bytes.size}B")
+                        }
+                        is FileJob -> {
+                            if (!runCatching {
+                                    contentResolver.openInputStream(head.uri)?.close()
+                                    true
+                                }.getOrDefault(false)) {
+                                queue.poll()
+                                event("文件不可读，已跳过：${head.name}")
+                                continue@dispatch
+                            }
+                            queue.poll()
+                            val inf = try {
+                                startFile(out, head, nextId++, 0)
+                            } catch (e: IOException) {
+                                queue.add(head); throw e
+                            }
+                            pending.addLast(inf)
+                        }
+                    }
+                }
+                // 3) 窗口满：阻塞等最老结果（120s 上限）；全空闲：小睡
+                if (pending.size >= SEND_WINDOW) {
+                    try {
+                        pending.first().future.get(120, TimeUnit.SECONDS)
+                    } catch (e: Exception) {
+                        throw IOException("file result wait failed: ${e.message}")
+                    }
+                    continue
+                }
+                if (pending.isEmpty() && retryQ.isEmpty() && queue.isEmpty()) Thread.sleep(50)
             }
+        } finally {
+            // 连接级失败/断开：在途与待重发任务重新入队，重拨后补发（顺序可能变化）
+            pending.forEach { queue.add(it.job) }
+            retryQ.forEach { queue.add(it) }
         }
     }
 
-    private enum class SendOutcome { OK, HASH_MISMATCH, PEER_REJECTED }
+    /** 一个已派发待收割的出站文件（writerLoop 窗口项）。 */
+    private class PendingSend(
+        val job: FileJob,
+        val id: Int,
+        val attempt: Int,
+        val future: CompletableFuture<FileResult>,
+        val localSha: ByteArray,
+    )
 
-    /** 发送单文件（B → D… → E → 等 F）。连接级错误抛 IOException（任务留队重拨补发）。 */
-    private fun sendOneFile(out: DataOutputStream, job: FileJob, id: Int): SendOutcome {
+    /** 发送单文件 B → D… → E，不等待 F（窗口由 writerLoop 收割）。连接级错误抛 IOException（任务留队重拨补发）。 */
+    private fun startFile(out: DataOutputStream, job: FileJob, id: Int, attempt: Int): PendingSend {
         val future = CompletableFuture<FileResult>()
         synchronized(resultLock) { fileResults[id] = future }
-
-        val flags = if (job.sizeKnown) 0 else Proto.FLAG_SIZE_UNKNOWN
-        synchronized(sendLock) {
-            Proto.writeFrame(out, Proto.F_FILE_BEGIN,
-                Proto.fileBeginPayload(id, flags, job.name, if (job.sizeKnown) job.size else 0L))
-        }
-        val digest = MessageDigest.getInstance("SHA-256")
-        val buf = ByteArray(Proto.CHUNK)
-        var sent = 0L
-        contentResolver.openInputStream(job.uri)?.use { ins ->
-            while (true) {
-                val n = ins.read(buf)
-                if (n < 0) break
-                if (n > 0) {
-                    digest.update(buf, 0, n)
-                    val data = if (n == buf.size) buf else buf.copyOf(n)
-                    // 契约 §5：D 帧载荷 = id u32 + data（接收方按此解析）
-                    val p = ByteArray(4 + data.size)
-                    p[0] = (id ushr 24).toByte(); p[1] = (id ushr 16).toByte()
-                    p[2] = (id ushr 8).toByte(); p[3] = id.toByte()
-                    data.copyInto(p, 4)
-                    synchronized(sendLock) { Proto.writeFrame(out, Proto.F_FILE_DATA, p) }
-                    sent += n
-                    reportProgress(job.name, if (job.sizeKnown) job.size else -1L, sent)
+        try {
+            val flags = if (job.sizeKnown) 0 else Proto.FLAG_SIZE_UNKNOWN
+            synchronized(sendLock) {
+                Proto.writeFrame(out, Proto.F_FILE_BEGIN,
+                    Proto.fileBeginPayload(id, flags, job.name, if (job.sizeKnown) job.size else 0L))
+            }
+            val digest = MessageDigest.getInstance("SHA-256")
+            val compress = shouldCompress(job.name)
+            val buf = ByteArray(Proto.CHUNK)
+            var sent = 0L
+            contentResolver.openInputStream(job.uri)?.use { ins ->
+                while (true) {
+                    val n = ins.read(buf)
+                    if (n < 0) break
+                    if (n > 0) {
+                        digest.update(buf, 0, n)
+                        val chunk = if (n == buf.size) buf else buf.copyOf(n)
+                        // v2 传输压缩：每块独立 zstd(level 1)，压不小则回退原样（协议 §5）
+                        var wire = chunk
+                        var z = false
+                        if (compress) {
+                            val c = Zstd.compress(chunk, 1)
+                            if (c.size < chunk.size) { wire = c; z = true }
+                        }
+                        synchronized(sendLock) { Proto.writeFileData(out, id, z, wire) }
+                        sent += n
+                        reportProgress(job.name, if (job.sizeKnown) job.size else -1L, sent)
+                    }
                 }
+            } ?: throw IOException("openInputStream failed: ${job.uri}")
+            synchronized(sendLock) {
+                Proto.writeFrame(out, Proto.F_FILE_END, Proto.idPayload(id))
+                out.flush()
             }
-        } ?: throw IOException("openInputStream failed: ${job.uri}")
-        synchronized(sendLock) {
-            Proto.writeFrame(out, Proto.F_FILE_END, Proto.idPayload(id))
-            out.flush()
-        }
-        val localSha = digest.digest()
-
-        val result = try {
-            future.get(120, TimeUnit.SECONDS)
+            return PendingSend(job, id, attempt, future, digest.digest())
         } catch (e: Exception) {
-            throw IOException("file result wait failed: ${e.message}")
-        } finally {
             synchronized(resultLock) { fileResults.remove(id) }
-        }
-        return when {
-            result.status == Proto.FSTATUS_OK &&
-                result.sha256?.contentEquals(localSha) == true -> {
-                event("文件已送达：${job.name}")
-                SendOutcome.OK
-            }
-            result.status == Proto.FSTATUS_IO || result.status == Proto.FSTATUS_CANCELLED -> {
-                event("对端拒收(status=${result.status})：${job.name}")
-                SendOutcome.PEER_REJECTED
-            }
-            else -> {
-                Log.w(TAG, "sha256 不符，整文件重发：${job.name}")
-                SendOutcome.HASH_MISMATCH
-            }
+            throw e
         }
     }
 
@@ -672,13 +732,33 @@ class SyncService : Service() {
                     Proto.F_IMAGE -> handleClipImage(payload)
                     Proto.F_FILE_BEGIN -> beginInbound(payload, transfers)
                     Proto.F_FILE_DATA -> {
+                        if (payload.size < 5) continue
                         val t = transfers[payload.readInt0()] ?: continue
                         if (t.failed) continue
                         try {
-                            t.stream.write(payload, 4, payload.size - 4)
-                            t.digest.update(payload, 4, payload.size - 4)
-                            t.bytes += payload.size - 4
-                            t.sinceProgress += payload.size - 4
+                            // 契约 §5（v2）：载荷 = id u32 + flags u8 + 数据；zstd 块解压后落盘，
+                            // 解压失败视同写入失败：只废此文件，不断连接
+                            val data: ByteArray
+                            var off: Int
+                            var len: Int
+                            if (payload[4].toInt() and Proto.FLAG_DF_ZSTD != 0) {
+                                val src = payload.copyOfRange(5, payload.size)
+                                val cap = Zstd.getFrameContentSize(src)
+                                    .let { if (it in 1..Proto.CHUNK.toLong()) it.toInt() else Proto.CHUNK }
+                                val dst = ByteArray(cap)
+                                off = 0
+                                len = Zstd.decompress(dst, src).toInt()
+                                data = dst
+                            } else {
+                                // raw：数据在载荷偏移 5 处，直接零拷贝引用 payload
+                                data = payload
+                                off = 5
+                                len = payload.size - 5
+                            }
+                            t.stream.write(data, off, len)
+                            t.digest.update(data, off, len)
+                            t.bytes += len
+                            t.sinceProgress += len
                             reportProgress(t.file.name, t.total, t.bytes)
                             if (t.sinceProgress >= Proto.PROGRESS_EVERY) {
                                 t.sinceProgress = 0
@@ -687,7 +767,7 @@ class SyncService : Service() {
                                         Proto.progressPayload(t.id, t.bytes)); out.flush()
                                 }
                             }
-                        } catch (e: IOException) {
+                        } catch (e: Throwable) {
                             t.failed = true
                             runCatching { t.stream.close() }; runCatching { t.file.delete() }
                             event("写入失败：${t.file.name}（${e.message}）")

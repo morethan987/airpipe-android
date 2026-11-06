@@ -9,7 +9,7 @@ import java.io.IOException
  * 帧 = 1B 类型 + 4B 载荷长度（大端）+ 载荷；读取方发现长度超上限判协议错误断开。
  */
 object Proto {
-    const val VER = 1
+    const val VER = 2
     const val TCP_PORT = 17580
     const val DISCOVER_PORT = 17580
     const val CHUNK = 131072                    // FILE_DATA 单帧上限 128 KiB
@@ -40,6 +40,9 @@ object Proto {
     // B 帧 flags
     const val FLAG_SIZE_UNKNOWN = 0x01
     const val FLAG_DIRECTORY = 0x02
+
+    // D 帧 flags（v2, §5）：载荷 = id u32 + flags u8 + 数据
+    const val FLAG_DF_ZSTD = 0x01
 
     // F 帧 status
     const val FSTATUS_OK = 0
@@ -95,6 +98,14 @@ object Proto {
 
     fun progressPayload(id: Int, bytes: Long): ByteArray =
         buildPayload(12) { writeInt(id); writeLong(bytes) }
+    /** 写 D 帧（v2）：直接流式写出 id+flags+数据，避免 128KiB 载荷二次拷贝。 */
+    fun writeFileData(out: DataOutputStream, id: Int, zstd: Boolean, data: ByteArray) {
+        out.write(F_FILE_DATA)
+        out.writeInt(4 + 1 + data.size)
+        out.writeInt(id)
+        out.writeByte(if (zstd) FLAG_DF_ZSTD else 0)
+        out.write(data)
+    }
 
     fun fileResultPayload(id: Int, status: Int, sha256: ByteArray?): ByteArray =
         buildPayload(4 + 1 + 32) {
