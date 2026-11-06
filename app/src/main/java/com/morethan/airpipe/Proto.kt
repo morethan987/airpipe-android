@@ -99,6 +99,10 @@ object Proto {
 
     fun progressPayload(id: Int, bytes: Long): ByteArray =
         buildPayload(12) { writeInt(id); writeLong(bytes) }
+
+    /** 构造 `G`：items u32, files u32, bytes u64（bytes=0 表示总量未知）。 */
+    fun batchBeginPayload(items: Int, files: Int, bytes: Long): ByteArray =
+        buildPayload(16) { writeInt(items); writeInt(files); writeLong(bytes) }
     /** 写 D 帧（v2）：直接流式写出 id+flags+数据，避免 128KiB 载荷二次拷贝。 */
     fun writeFileData(out: DataOutputStream, id: Int, zstd: Boolean, data: ByteArray) {
         out.write(F_FILE_DATA)

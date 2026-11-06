@@ -46,7 +46,7 @@ class ShareReceiverActivity : Activity() {
                 val stream = intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri
                 val text = intent.getStringExtra(Intent.EXTRA_TEXT)
                 when {
-                    stream != null -> { handleUri(stream); handled = true }
+                    stream != null -> { enqueueAll(listOf(stream)); handled = true }
                     !text.isNullOrEmpty() -> { SyncService.enqueueText(this, text); handled = true }
                 }
             }
@@ -54,7 +54,7 @@ class ShareReceiverActivity : Activity() {
                 @Suppress("DEPRECATION")
                 val streams = intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
                 if (!streams.isNullOrEmpty()) {
-                    streams.forEach { handleUri(it) }
+                    enqueueAll(streams)
                     handled = true
                 }
             }
@@ -70,18 +70,20 @@ class ShareReceiverActivity : Activity() {
         }
     }
 
-    private fun handleUri(uri: Uri) {
-        val name = runCatching {
-            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-                ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
-        }.getOrNull() ?: uri.lastPathSegment ?: "unnamed.bin"
-
-        val size = runCatching {
-            contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)
-                ?.use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null }
-        }.getOrNull()
-
-        SyncService.enqueueFile(this, uri, name, size != null, size ?: -1L)
-        Log.d(TAG, "[分享入队] name=$name size=$size")
+    /** 一次分享动作 = 一批（协议 §6）：全部 URI 元数据收集完一次入队。 */
+    private fun enqueueAll(uris: List<Uri>) {
+        val shares = uris.map { uri ->
+            val name = runCatching {
+                contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                    ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+            }.getOrNull() ?: uri.lastPathSegment ?: "unnamed.bin"
+            val size = runCatching {
+                contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)
+                    ?.use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null }
+            }.getOrNull()
+            SyncService.PendingShare(uri, name, size != null, size ?: -1L)
+        }
+        SyncService.enqueueFiles(this, shares)
+        shares.forEach { Log.d(TAG, "[分享入队] name=${it.name} size=${it.size}") }
     }
 }

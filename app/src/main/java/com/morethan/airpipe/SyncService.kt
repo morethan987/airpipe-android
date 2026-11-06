@@ -57,6 +57,9 @@ object PairCtl {
  */
 class SyncService : Service() {
 
+    /** 待入队的单个分享项（enqueueFiles 的元素）。 */
+    class PendingShare(val uri: Uri, val name: String, val sizeKnown: Boolean, val size: Long)
+
     companion object {
         private const val TAG = "Airpipe"
         private const val CHANNEL_ID = "airpipe_channel"
@@ -68,6 +71,8 @@ class SyncService : Service() {
 
         // ---- 进程级共享状态（蹦床/分享/配对页在任意线程投递） ----
         private val queue = ConcurrentLinkedQueue<Job>()
+        /** 多元素原子入队/重排互斥（enqueue* 与 requeueBatches）；单元素 poll/add 自并发安全 */
+        private val queueLock = Any()
         private val fileResults = HashMap<Int, CompletableFuture<FileResult>>()
         private val resultLock = Any()
 
@@ -83,11 +88,22 @@ class SyncService : Service() {
 
         sealed interface Job
         data class TextJob(val mime: String, val bytes: ByteArray) : Job
+
+        /** 一次用户动作的批界（协议 §6 G 帧）：files 为批内文件数。 */
+        class BatchStart(
+            val batchId: Long,
+            val items: Int,
+            val files: Int,
+            val bytes: Long,
+            val sizeKnown: Boolean,
+        ) : Job
+
         data class FileJob(
             val uri: Uri,
             val name: String,
             val sizeKnown: Boolean,
             val size: Long,
+            val batchId: Long,
         ) : Job
 
         class FileResult(val status: Int, val sha256: ByteArray?)
@@ -111,6 +127,28 @@ class SyncService : Service() {
             val ext = name.substringAfterLast('.', "").lowercase()
             return ext.isEmpty() || ext !in INCOMPRESSIBLE
         }
+        private val batchSeq = java.util.concurrent.atomic.AtomicLong()
+
+
+        /**
+         * 一次用户动作 = 一批（协议 §6）：BatchStart 划界 + N 个 FileJob，
+         * PC 端据此把整批聚合为一条通知。单文件同样走批（files=1）。
+         */
+        fun enqueueFiles(context: Context, shares: List<PendingShare>) {
+            if (shares.isEmpty()) return
+            val id = batchSeq.incrementAndGet()
+            val known = shares.filter { it.sizeKnown }
+            synchronized(queueLock) {
+                queue.add(
+                    BatchStart(
+                        id, shares.size, shares.size,
+                        known.sumOf { it.size }, known.size == shares.size,
+                    )
+                )
+                shares.forEach { queue.add(FileJob(it.uri, it.name, it.sizeKnown, it.size, id)) }
+            }
+            kick(context)
+        }
 
         fun enqueueText(context: Context, text: String) {
             val bytes = text.toByteArray(Charsets.UTF_8)
@@ -119,15 +157,15 @@ class SyncService : Service() {
                 return
             }
             // 文本条目合并：剪贴板语义天然只保留最新一条（协议 §8）
-            queue.removeAll { it is TextJob }
-            queue.add(TextJob("text/plain;charset=utf-8", bytes))
+            synchronized(queueLock) {
+                queue.removeAll { it is TextJob }
+                queue.add(TextJob("text/plain;charset=utf-8", bytes))
+            }
             kick(context)
         }
 
-        fun enqueueFile(context: Context, uri: Uri, name: String, sizeKnown: Boolean, size: Long) {
-            queue.add(FileJob(uri, name, sizeKnown, size))
-            kick(context)
-        }
+        fun enqueueFile(context: Context, uri: Uri, name: String, sizeKnown: Boolean, size: Long) =
+            enqueueFiles(context, listOf(PendingShare(uri, name, sizeKnown, size)))
 
         fun startPairing(context: Context, code: String, host: String?) {
             synchronized(PairCtl.lock) {
@@ -581,6 +619,16 @@ class SyncService : Service() {
         var nextId = 1
         val pending = ArrayDeque<PendingSend>() // 在途：E 已发，F 未回
         val retryQ = ArrayDeque<FileJob>()      // sha 不符，待整文件重发一次
+        // 活跃批（协议 §6）：dispatch 到 BatchStart 时置位并发 G；
+        // 批内全部文件终态（送达/拒收/跳过/失败）后清零，批间串行
+        var activeBatch: BatchStart? = null
+        var activeRemaining = 0
+        fun settle(job: FileJob) {
+            if (activeBatch?.batchId == job.batchId && --activeRemaining <= 0) {
+                activeBatch = null
+                activeRemaining = 0
+            }
+        }
         try {
             while (alive && !sock.isClosed) {
                 // 1) 收割完成的结果（readLoop 收 F 后补全 future）
@@ -598,11 +646,13 @@ class SyncService : Service() {
                         res.status == Proto.FSTATUS_OK &&
                             res.sha256?.contentEquals(inf.localSha) == true -> {
                             iter.remove()
+                            settle(inf.job)
                             event("文件已送达：${inf.job.name}")
                             clearTransfer()
                         }
                         res.status == Proto.FSTATUS_IO || res.status == Proto.FSTATUS_CANCELLED -> {
                             iter.remove()
+                            settle(inf.job)
                             event("对端拒收(status=${res.status})：${inf.job.name}")
                             clearTransfer()
                         }
@@ -613,6 +663,7 @@ class SyncService : Service() {
                         }
                         else -> {
                             iter.remove()
+                            settle(inf.job)
                             event("文件发送失败（校验不符）：${inf.job.name}")
                             clearTransfer()
                         }
@@ -643,12 +694,26 @@ class SyncService : Service() {
                             queue.poll()
                             event("已推送剪贴板文本 ${head.bytes.size}B")
                         }
+                        is BatchStart -> {
+                            if (activeBatch != null) break@dispatch // 批间串行：上批清零后才开新批
+                            synchronized(sendLock) {
+                                Proto.writeFrame(
+                                    out, Proto.F_BATCH_BEGIN,
+                                    Proto.batchBeginPayload(head.items, head.files, if (head.sizeKnown) head.bytes else 0L)
+                                )
+                                out.flush()
+                            }
+                            activeBatch = head
+                            activeRemaining = head.files
+                            queue.poll()
+                        }
                         is FileJob -> {
                             if (!runCatching {
                                     contentResolver.openInputStream(head.uri)?.close()
                                     true
                                 }.getOrDefault(false)) {
                                 queue.poll()
+                                settle(head)
                                 event("文件不可读，已跳过：${head.name}")
                                 continue@dispatch
                             }
@@ -674,9 +739,36 @@ class SyncService : Service() {
                 if (pending.isEmpty() && retryQ.isEmpty() && queue.isEmpty()) Thread.sleep(50)
             }
         } finally {
-            // 连接级失败/断开：在途与待重发任务重新入队，重拨后补发（顺序可能变化）
-            pending.forEach { queue.add(it.job) }
-            retryQ.forEach { queue.add(it) }
+            // 断线重排：未终态文件按批聚齐重入队，批界（G）完整性交给重拨后的首个 G
+            requeueBatches(pending, retryQ)
+        }
+    }
+
+    /**
+     * 断线重排（协议 §6）：drain 队列后按 batchId 分组重组——每批一个重算过的
+     * BatchStart（files=剩余数）领头 + 其文件，避免尾加打散批界导致 PC 收到
+     * 错位的 G。文本条目保序在前。与 enqueue* 互斥（queueLock）保证多元素原子。
+     */
+    private fun requeueBatches(pending: ArrayDeque<PendingSend>, retryQ: ArrayDeque<FileJob>) {
+        synchronized(queueLock) {
+            val drained = mutableListOf<Job>()
+            while (true) queue.poll()?.let { drained.add(it) } ?: break
+            val groups = LinkedHashMap<Long, MutableList<FileJob>>()
+            for (j in drained) when (j) {
+                is BatchStart -> groups.getOrPut(j.batchId) { mutableListOf() } // 占位保组序
+                is FileJob -> groups.getOrPut(j.batchId) { mutableListOf() }.add(j)
+                is TextJob -> {}
+            }
+            for (j in pending.asSequence().map { it.job } + retryQ.asSequence()) {
+                groups.getOrPut(j.batchId) { mutableListOf() }.add(j)
+            }
+            drained.filterIsInstance<TextJob>().forEach { queue.add(it) }
+            groups.forEach { (id, jobs) ->
+                if (jobs.isEmpty()) return@forEach
+                val known = jobs.filter { it.sizeKnown }
+                queue.add(BatchStart(id, jobs.size, jobs.size, known.sumOf { it.size }, known.size == jobs.size))
+                jobs.forEach { queue.add(it) }
+            }
         }
     }
 
