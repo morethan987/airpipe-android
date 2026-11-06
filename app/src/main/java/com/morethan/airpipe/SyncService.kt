@@ -737,6 +737,42 @@ class SyncService : Service() {
 
     // ---------------------------------------------------------------- reader
 
+    /**
+     * 一次用户发送动作（G 帧划界，协议 §6）：进度与完成事件按批聚合——
+     * 传输通知整批存续（不逐文件撤/建），常驻通知只发一条批完成事件。
+     */
+    private class Batch(
+        val items: Int,       // G.items（顶层项数）；-1 = 未见 G 的隐式批
+        val files: Int,       // G.files（批内文件总数）；-1 = 未知
+        val bytes: Long,      // G.bytes（批内总字节）；<=0 = 未知（进度转圈）
+    ) {
+        var filesDone = 0     // 已收 E/X 的文件数（含失败与 PC 整文件重发）
+        var okCount = 0
+        var failCount = 0
+        var bytesDone = 0L    // 已完结文件累计字节
+        val tops = LinkedHashSet<String>() // 顶层名（B 帧首段收集）
+        var sawDir = false    // 批内出现目录帧或层级路径 → 文件夹语义
+
+        /** 传输通知标签：单顶层用其名（即文件夹名），多顶层报数量。 */
+        fun label(): String =
+            if (tops.size == 1) tops.first() else "${maxOf(items, tops.size)} 个项目"
+
+        /** 批完成事件（用户语义：一次发送 = 一个事件）。 */
+        fun finalText(): String {
+            val size = if (bytesDone > 0) " · ${humanBytes(bytesDone)}" else ""
+            val fail = if (failCount > 0) "，$failCount 个失败" else ""
+            return when {
+                tops.size == 1 && sawDir ->
+                    "收到文件夹：${tops.first()}（$okCount 个文件$size）$fail"
+                tops.size == 1 ->
+                    "收到文件：${tops.first()}（${humanBytes(bytesDone)}）$fail"
+                else ->
+                    "收到 ${maxOf(items, tops.size)} 个项目（$okCount 个文件$size）$fail"
+            }
+        }
+    }
+
+
     private class Inbound(
         val id: Int,
         val file: File,
@@ -746,7 +782,11 @@ class SyncService : Service() {
         var bytes: Long = 0,
         var sinceProgress: Long = 0,
         var failed: Boolean = false,
+        val batch: Batch,
     )
+
+    /** 当前接收批；readLoop 生命周期内有效（单连接单读循环）。 */
+    private var inboundBatch: Batch? = null
 
     private fun readLoop(sock: SSLSocket, out: DataOutputStream, host: String) {
         val input = DataInputStream(BufferedInputStream(sock.getInputStream()))
@@ -774,6 +814,15 @@ class SyncService : Service() {
                     }
                     Proto.F_TEXT -> handleClipText(payload)
                     Proto.F_IMAGE -> handleClipImage(payload)
+                    Proto.F_BATCH_BEGIN -> {
+                        val g = Proto.parseBatch(payload)
+                        // 上一批未自然完结即被新批顶替（如 PC 整批重发）：
+                        // 已落盘部分仍如实结算，不留无声丢失
+                        inboundBatch?.let { old ->
+                            if (old.okCount > 0) event(old.finalText() + "（中断）")
+                        }
+                        inboundBatch = Batch(g.items, g.files, g.bytes)
+                    }
                     Proto.F_FILE_BEGIN -> beginInbound(payload, transfers)
                     Proto.F_FILE_DATA -> {
                         if (payload.size < 5) continue
@@ -803,7 +852,14 @@ class SyncService : Service() {
                             t.digest.update(data, off, len)
                             t.bytes += len
                             t.sinceProgress += len
-                            reportProgress("↓ ${t.file.name}", t.total, t.bytes)
+                            // 批聚合进度：整批一条通知存续，字节按批累计（§6）
+                            val b = t.batch
+                            if (b.bytes > 0) {
+                                val live = transfers.values.sumOf { if (it.batch === b) it.bytes else 0L }
+                                reportProgress("↓ ${b.label()}", b.bytes, (b.bytesDone + live).coerceAtMost(b.bytes))
+                            } else {
+                                reportProgress("↓ ${b.label()}", -1L, 0L)
+                            }
                             if (t.sinceProgress >= Proto.PROGRESS_EVERY) {
                                 t.sinceProgress = 0
                                 synchronized(sendLock) {
@@ -836,7 +892,9 @@ class SyncService : Service() {
                         t.failed = true
                         runCatching { t.stream.close() }; runCatching { t.file.delete() }
                         transfers.remove(t.id)
-                        clearTransfer()
+                        t.batch.filesDone++
+                        t.batch.failCount++
+                        maybeFinalizeBatch(t.batch, transfers)
                     }
                     Proto.F_BYE -> {
                         Log.i(TAG, "对端 BYE：${payload.drop(1).toByteArray().toString(Charsets.UTF_8)}")
@@ -857,6 +915,7 @@ class SyncService : Service() {
             Log.d(TAG, "入站连接结束: ${e.message}")
         } finally {
             clearTransfer()
+            inboundBatch = null
             transfers.values.forEach {
                 runCatching { it.stream.close() }
                 // 传输中断：.part 半截文件永不暴露正式名，直接清理
@@ -878,9 +937,12 @@ class SyncService : Service() {
         try {
             if (b.flags and Proto.FLAG_DIRECTORY != 0) {
                 target.mkdirs()
-                event("已创建目录 ${target.name}")
+                // 批内目录帧静默建骨架；批外孤立目录（如仅发一个空目录）
+                // 才单独成事件
+                if (noteBatchTop(clean, isDir = true)) event("已创建目录 ${target.name}")
                 return
             }
+            noteBatchTop(clean, isDir = false)
             target.parentFile?.mkdirs()
             val part = File(target.parentFile, target.name + ".part")
             transfers[b.id] = Inbound(
@@ -888,6 +950,7 @@ class SyncService : Service() {
                 FileOutputStream(part),
                 MessageDigest.getInstance("SHA-256"),
                 total = if (b.flags and Proto.FLAG_SIZE_UNKNOWN != 0) -1L else b.size,
+                batch = inboundBatch!!,
             )
         } catch (e: IOException) {
             Log.w(TAG, "B 帧建文件失败: ${e.message}")
@@ -897,29 +960,55 @@ class SyncService : Service() {
     private fun endInbound(payload: ByteArray, transfers: HashMap<Int, Inbound>, out: DataOutputStream) {
         val id = payload.readInt0()
         val t = transfers.remove(id) ?: return
-        // E 帧即撤进度通知（cancel 幂等立即生效，无完成态渲染竞争）；
-        // 完成结果由常驻通知「最近事件」承载
-        clearTransfer()
+        val b = t.batch
+        b.filesDone++
+        // 批聚合：不逐文件撤/建进度通知，也不逐文件发事件（§6——一次
+        // 用户发送 = 一个事件，批收尾时一并结算）
         val part = File(t.file.parentFile, t.file.name + ".part")
         runCatching { t.stream.close() }
-        if (t.failed) return
+        if (t.failed) {
+            b.failCount++
+            maybeFinalizeBatch(b, transfers)
+            return
+        }
         val sha = t.digest.digest()
         try {
             if (!part.renameTo(t.file)) throw IOException("rename failed")
             MediaScannerConnectionCompat.scan(this, t.file)
-            event("收到文件：${t.file.name}（${t.bytes}B）")
+            b.okCount++
+            b.bytesDone += t.bytes
             synchronized(sendLock) {
                 Proto.writeFrame(out, Proto.F_FILE_RESULT,
                     Proto.fileResultPayload(id, Proto.FSTATUS_OK, sha)); out.flush()
             }
         } catch (e: Exception) {
             runCatching { part.delete() }
-            event("收件失败：${t.file.name}（${e.message}）")
+            b.failCount++
             synchronized(sendLock) {
                 Proto.writeFrame(out, Proto.F_FILE_RESULT,
                     Proto.fileResultPayload(id, Proto.FSTATUS_IO, null)); out.flush()
             }
         }
+        maybeFinalizeBatch(b, transfers)
+    }
+
+    /** B 帧归属当前批；无批（未见 G）则开隐式批聚合。返回是否新开了隐式批。 */
+    private fun noteBatchTop(cleanRel: String, isDir: Boolean): Boolean {
+        val fresh = inboundBatch == null
+        val b = inboundBatch ?: Batch(-1, -1, -1L).also { inboundBatch = it }
+        b.tops.add(cleanRel.substringBefore('/'))
+        if (isDir || cleanRel.contains('/')) b.sawDir = true
+        return fresh
+    }
+
+    /** 批收尾：G 声明的文件全部收尾（E/X 计数）且无在途 → 一条完成事件 + 撤进度通知。 */
+    private fun maybeFinalizeBatch(b: Batch, transfers: HashMap<Int, Inbound>) {
+        if (inboundBatch !== b) return
+        if (b.files >= 0 && b.filesDone < b.files) return
+        if (transfers.values.any { it.batch === b }) return
+        inboundBatch = null
+        clearTransfer()
+        event(b.finalText())
     }
 
     /** relPath 消毒（协议 §7）：剥前导 /，弃 .. 与空段，其余保留。 */
@@ -1013,4 +1102,11 @@ class SyncService : Service() {
             TRANSFER_CHANNEL_ID, "Airpipe 传输进度", NotificationManager.IMPORTANCE_LOW,
         ))
     }
+}
+/** 字节数人性化（批完成事件文案用，顶层供嵌套 Batch 调用）。 */
+private fun humanBytes(n: Long): String = when {
+    n < 1024 -> "${n}B"
+    n < 1 shl 20 -> "%.1fKB".format(n / 1024.0)
+    n < 1 shl 30 -> "%.1fMB".format(n / 1024.0 / 1024)
+    else -> "%.1fGB".format(n / 1024.0 / 1024 / 1024)
 }

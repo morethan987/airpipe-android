@@ -33,6 +33,7 @@ object Proto {
     const val F_FILE_PROGRESS = 'R'.code
     const val F_FILE_RESULT = 'F'.code
     const val F_CANCEL = 'X'.code
+    const val F_BATCH_BEGIN = 'G'.code
     const val F_PAIR_REQUEST = 'Q'.code
     const val F_PAIR_ACCEPT = 'A'.code
     const val F_BYE = 'Y'.code
@@ -163,6 +164,13 @@ object Proto {
     }
 
     data class BeginInfo(val id: Int, val flags: Int, val relPath: String, val size: Long)
+    data class BatchInfo(val items: Int, val files: Int, val bytes: Long)
+
+    /** 解析 `G`：items u32, files u32, bytes u64。 */
+    fun parseBatch(p: ByteArray): BatchInfo {
+        val d = java.io.ByteArrayInputStream(p).let { java.io.DataInputStream(it) }
+        return BatchInfo(d.readInt(), d.readInt(), d.readLong())
+    }
 
     private val EMPTY = ByteArray(0)
 
